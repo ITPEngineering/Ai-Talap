@@ -1,0 +1,186 @@
+#!/usr/bin/perl
+
+# discover Logix Box PLCs on the local network.
+# version 1 used MDNS which proved overly complex and freaky.
+# version 2 uses a multicast group ff02::4c6f:6769:6342:6f78
+# dedicated to LogicBox discovery
+
+use strict; no strict 'subs';
+use Carp;
+use JSON;
+use POSIX;
+use Digest::SHA qw(sha256);
+use Data::Dumper;
+my $basedir;
+BEGIN {
+    # find the base directory path, assuming this script is
+    # started as /path/to/basedir/host/script
+    # or /path/to/basedir/bin/script
+    $basedir = ($0 =~ m,^(/.+)/([^/]+)/[^/]+$,? $1: # /path/bin/script
+                $0 =~ m,^\./[^/]+$,? (getcwd =~ m,^(.*)/([^/]+),, $1):
+                $0 =~ m,^()([^/]+)/[^/]+$,? getcwd: # bin/script
+                $0 =~ m,^(.+)/([^/]+)/[^/]+$,? (`cd $1; pwd`): # ../bin/script
+                die "could not infer basedir from $0");
+    chomp $basedir;
+    unshift @INC, "$basedir/$2/MBclient/lib";
+    unshift @INC, "$basedir/$2";
+};
+use NPC21::Conf;
+use NPC21::Modbus;
+
+
+sub usage {
+    die "Usage: atdiscover [-n|--newonly] [-f /path/to/conf.yml]\n";
+}
+
+
+my $conffile = "$basedir/conf/conf.yml";
+my $newonly;  # -n: hush plcs/bcs already present in conf.yml
+my $verbose;  # -v: output redundant inf as we go
+
+$SIG{PIPE} = sub {die "got SIGPIPE, probably Modbus connection failed\n"};
+
+sub parse_args {
+    while (local $_ = shift @ARGV) {
+        if (/^-f(.*)$/) {
+            $conffile = $1 || shift @ARGV;
+        }
+        elsif (/^-n|--newonly$/) {
+            $newonly = 1;
+        }
+        elsif (/^-v|--verbose$/) {
+            $verbose = 1;
+        }
+        else {
+            usage ();
+        }
+    }
+}
+
+sub list_ifaces {
+    my @res;
+    for (`ip link ls`) {
+        # 2: eth0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc pfifo_fast state UP mode DEFAULT group default qlen 1000
+        if (/^\d+: (\w+):/ ) {
+            my $iface = $1;
+            next if /NOARP/;
+            next unless /,UP,/;
+            next unless /MULTICAST/;
+            push @res, $iface;
+        }
+    }
+    return @res;
+}
+
+
+sub get_getails {
+    my ($mac, $iface) = @_;
+    my $m = NPC21::Modbus->new(HOST => $mac, IFACE => $iface);
+    my %req;
+    $req{"getconf"} = "1";
+    $req{"get"}{"sys.ipaddr"} = "";
+    $req{"get"}{"sys.devtype"} = "";
+    my $json = JSON->new;
+    my $img = $json->encode(\%req);
+    my $req = pack("a32a*", sha256($img), $img);
+    my $reply = $m->npc21(NPC21::Modbus::TAG_CMDS, $req);
+    my $err = NPC21::Modbus::error ($reply);
+    if ($err) {
+        die "CMDS command: $err\n";
+    }
+    if (length ($reply) < 1+256/8) {
+        die "CMDS command: unexpected short reply: ", length ($reply), "\n";
+    }
+    if ($m->npc21_len() > NPC21::Modbus::MAXLEN) { # there is a continuation
+        my $reply2;
+        do {
+            my $req = pack("N", length($reply));
+            $reply2 = $m->npc21(NPC21::Modbus::TAG_MORE, $req);
+            if (my $err = NPC21::Modbus::error ($reply2)) {
+                die "MORE command: $err\n";
+            }
+            $reply .= substr($reply2, 1);
+        } while (length ($reply2) == NPC21::Modbus::MAXLEN);
+    }
+    my (undef, $digest, $body) = unpack ("Ca32a*", $reply);
+    if (sha256($body) ne $digest) {
+        warn HexDump($reply);
+        die "CMDS command: reply sha256 check failed\n";
+    }
+
+    my @res;
+    my $hh = decode_json ($body);
+    if (! defined $hh->{getconf}) {
+        die "incomplete reply (getconf missing)";
+    }
+    my $conf = $hh->{getconf}? decode_json ($hh->{getconf}): {};
+    push @res, $conf->{hostname} || "<noname>";
+
+    for ("sys.ipaddr", "sys.devtype") {
+        if (! $hh->{get} || ! exists $hh->{get}{$_}) {
+            die "incomplete reply ($_ missing)";
+        }
+    }
+    push @res, $hh->{get}{"sys.devtype"} || "<notype>";
+    push @res, sprintf "[%s]", $hh->{get}{"sys.ipaddr"} || "";
+
+    return "@res";
+}
+
+
+
+parse_args();
+
+my @ifaces = list_ifaces();
+@ifaces || die "ip link ls found no suitable interfaces";
+
+# ping on all suitable interfaces in parallel to speed up
+my $logicbox_mcast_addr =  "ff02::4c6f:6769:6342:6f78";
+my @cmd;
+for my $iface (@ifaces) {
+    push @cmd, "ping6 -w2 $logicbox_mcast_addr\%$iface"
+}
+my $cmd = join '&', @cmd;
+#warn $cmd;
+my %seen;
+for (`$cmd`) {
+    # 64 bytes from fe80::f612:faff:fed5:5197%eth1: icmp_seq=0 ttl=255 time=1.362 ms
+    /^64 bytes from fe80::(\w+):(\w+):(\w+):(\w+)\%(\w+)/
+        && do {
+            my $iface = $5;
+            my @a = map {hex} $1, $2, $3, $4;
+            $a[0] ^= 0x0200;
+            my @b = map {($_ >> 8, $_ & 0xff)} @a;
+            splice @b, 3, 2;  # take out ff:fe
+            my $macaddr = sprintf "%02x:%02x:%02x:%02x:%02x:%02x", @b;
+            $seen{$macaddr}{$iface} = 1;  # same MAC can be seen on multiple ifaces
+            warn "seen $macaddr at $iface\n" if $verbose;
+    };
+}
+
+MAC: for my $mac (sort keys %seen) {
+    $seen{$mac} = [keys %{$seen{$mac}}];  # convert seen{}{} to seen{}[]
+    if ($newonly) {
+        # need conffile for the first time
+        my $tree = NPC21::Conf::load($conffile);
+        #die Dumper $tree;
+        for my $plc_name (keys %$tree) {
+            if (my $macaddr = $tree->{$plc_name}{macaddr}) {
+                if ($macaddr eq $mac) {
+                    next MAC;
+                }
+            }
+        }
+    }
+    my $iface = $seen{$mac}[0];
+    my $ifaces = join ",", @{$seen{$mac}};
+    my $details = eval {get_getails ($mac, $iface)};
+    if ($details) {
+        print "$details $mac $ifaces\n";
+    }
+    else {
+        print "$mac $ifaces: $@";
+    }
+}
+
+exit 0;

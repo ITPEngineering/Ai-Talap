@@ -1,0 +1,98 @@
+# Single conffile for multiple LogicBox units
+# YAML syntax
+
+bc111:
+  clock:
+    TZ: MSK
+    sntp_server: ntp.ix.ru
+    sntp_server: pool.ntp.org
+    sntp_smooth: y  # y=use adjtime, n=use settimeofday
+
+  var:
+    START: 0
+    OUT1: 1
+    OUT2: 1
+  task0:
+    period: 10ms
+    maxrun: 15ms
+    prog1: {enable: y, file: "examples/01-oscillator.st"}
+  on_stop:
+    maxrun: 100ms
+    prog991: {enable: y, file: "examples/01-onstop.st"}
+
+  slot-1:
+    module: bcbase
+    macaddr: f4:12:fa:dd:c6:1f
+
+    modbus_server:
+      tcp_port: 502  # optional; if present, enables Modbus TCP
+      holding0: {var_out: mw0}
+      holding2: {var: mw1}
+      holding10..13: {var: ao0..3}
+      holding4..7: {var_out: ai0..3}
+      holding8..9: {var_out: dt0..2}
+
+    rs485:
+      speed: 115200
+      parity: N
+      bits: 8
+      stop_bits: 1
+      termination: 120  # optional; 100 or 120 or 680 Ohm
+
+    modbus_client:
+      addr: 0x01  # Modbus RTU
+      holding0..2: {var: dt0..2, period: 1s}
+
+  slot1:
+    module: bcdi
+    in0..15:
+      var: mw0.0..15
+
+  slot2:
+    module: bcdo
+    out0..15:
+      var_out: mw1.0..15
+      init: last
+
+  slot3:
+    module: bcai
+    in0:
+      mode: 4-20mA
+      range: 10  # ignore changes smaller than this -- in "natural" units
+      interval: 0.5s  # don't sent more than twice a second
+      period: 1s # send once a second even if no change 
+      natural: [4000, 20000] # report 4mA as 4000, ... 20mA as 20000
+      var: ai0
+    in1:
+      mode: 4-20mA
+      range: 10
+      interval: 0.5s
+      period: 1s
+      natural: [4000, 20000]
+      var: ai1
+    in2:
+      mode: 0-10V
+      range: 2  # in "natural" units = 2mV
+      interval: 0.5s
+      period: 1s
+      natural: [0, 10000] # report voltagi in mV
+      var: ai2
+    in3:
+      mode: 0-10V
+      range: 2
+      interval: 0.5s
+      period: 1s
+      natural: [0, 10000]
+      var: ai3
+
+  slot4:
+    module: bcao
+    # current loop 4-20mA output
+    out0: {mode: 4-20mA, var_out: ao0, natural: [4000, 20000]}
+    # current loop 4-20mA output
+    out1: {mode: 4-20mA, var_out: ao1, natural: [4000, 20000]}
+    # 0-10V voltage output
+    out2: {mode: 0-10V, var_out: ao2, natural: [0, 10000]}
+    # 0-10V voltage output
+    out3: {mode: 0-10V, var_out: ao3, natural: [0, 10000]}
+

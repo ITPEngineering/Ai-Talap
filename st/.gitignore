@@ -1,0 +1,5 @@
+dlopen-example
+linker-script.ld
+*.map
+linker-script.ld.new
+make.out

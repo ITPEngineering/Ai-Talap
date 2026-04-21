@@ -1,0 +1,12 @@
+Build.PL
+Changes
+examples/read_10_reg.pl
+examples/tk_disp_reg.pl
+lib/MBclient.pm
+LICENSE
+Makefile.PL
+MANIFEST			This list of files
+README.pod
+t/MBclient.t
+t/pod-coverage.t
+t/pod.t

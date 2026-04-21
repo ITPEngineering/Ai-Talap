@@ -1,0 +1,148 @@
+#!/usr/bin/perl
+
+# upload YAML config to LogicBox PLC
+
+use strict; no strict 'subs';
+use Carp;
+use JSON;
+use Data::Dumper;
+use Time::HiRes qw(sleep gettimeofday tv_interval);
+use POSIX;
+use Socket;  # for inet_ntoa
+use Digest::SHA qw(sha256);
+my $basedir;
+BEGIN {
+    # find the base directory path, assuming this script is
+    # started as /path/to/basedir/host/script
+    # or /path/to/basedir/bin/script
+    $basedir = ($0 =~ m,^(/.+)/([^/]+)/[^/]+$,? $1: # /path/bin/script
+                $0 =~ m,^\./[^/]+$,? (getcwd =~ m,^(.*)/([^/]+),, $1):
+                $0 =~ m,^()([^/]+)/[^/]+$,? getcwd: # bin/script
+                $0 =~ m,^(.+)/([^/]+)/[^/]+$,? (`cd $1; pwd`): # ../bin/script
+                die "could not infer basedir from $0");
+    chomp $basedir;
+    unshift @INC, "$basedir/$2/MBclient/lib";
+    unshift @INC, "$basedir/$2";
+};
+use NPC21::Conf;
+use NPC21::Modbus;
+
+
+sub usage {
+    confess "Usage: atconf {PLCNAME|--all} [-f /path/to/conf.yml] [--bymac [-i ethN]]\n";
+}
+
+
+my $plc_name;  # as seen in conf.yml
+my $lan_slot;  # access PLC via LAN port in this slot
+my $bymac; # use IPv6 even if static ipaddr is present in conf.yml
+my $iface; # if not specified, will try all ifaces in parallel
+my $conffile = "$basedir/conf/conf.yml";
+my $timeout = 10;  # for CONFSTAT, seconds
+
+
+sub parse_args {
+    while (local $_ = shift @ARGV) {
+        if (/^([a-z][.\w]+)(:(\d+))?$/i && !$plc_name) {
+            $plc_name = $1;
+            $lan_slot = $3;
+        }
+        elsif (/^-f(.*)$/) {
+            $conffile = $1 || shift @ARGV;
+        }
+        elsif (/^--bymac$/) {
+            $bymac = 1;
+        }
+        elsif (/^-i(\S*)$/) {
+            $iface = $1 || shift @ARGV // usage();
+        }
+        else {
+            usage ();
+        }
+    }
+    usage unless $plc_name;
+    usage if $iface && !$bymac;
+}
+
+
+$SIG{PIPE} = sub {
+    die ("got SIGPIPE, probably Modbus connection failed\n",
+         "Try --bymac?\n");
+};
+
+parse_args();
+my $tree = NPC21::Conf::load($conffile);
+#die Dumper $tree;
+
+if ($plc_name eq "all") {
+    for (sort keys %$tree) {
+        next unless /^(plc|bc|at)\S*$/;
+        system $0, $_;
+        $? == 0 || exit $?>>8;
+    }
+}
+
+if (! $tree->{$plc_name}) {
+    die "$conffile: `$plc_name' not present\n";
+}
+
+# hostname equals to plc_name by default but can be set explicitly
+$tree->{$plc_name}{hostname} //= $plc_name;
+
+my $ipaddr = ($tree->{$plc_name}{ipaddr} =~ s/\/\d+//r);  # static IP, optional
+my $macaddr = NPC21::Conf::macaddr ($tree, $plc_name, $lan_slot);
+
+if ($bymac) {
+    $ipaddr = undef;
+}
+# add timestamp
+#if ($plc_name =~ /^bc/) {  # until net/net-104 are updated too
+#    $tree->{$plc_name}{stamp} = (stat($conffile))[9];  # mtime
+#}
+
+# convert configuration subtree of the PLC to JSON to be uploaded
+my $json = JSON->new->canonical([ENABLE]); # canonical == sorted keys
+my $img = $json->encode($tree->{$plc_name});
+my $m = NPC21::Modbus->new(HOST => ($ipaddr || $macaddr), IFACE => $iface);
+# TODO: PORT from conf.yml
+
+my $offset = 0;
+my $chunksz = NPC21::Modbus::MAXLEN - 4; # shorter in npc21_modbus_start
+while (my $piece = substr($img, $offset, $chunksz)) {
+    #warn "chunk upload: @{[length $piece]}\@$offset\n";
+    my $reply;
+    if ($offset == 0) {
+        my $pktlen = pack("N", length $img);
+        $reply = $m->npc21(NPC21::Modbus::TAG_START, $pktlen.$piece);
+    }
+    else {
+        $reply = $m->npc21(NPC21::Modbus::TAG_UPDATE, $piece);
+    }
+    if (my $err = NPC21::Modbus::error ($reply)) {
+        die "chunk upload error: $err\n";
+    }
+    $offset += $chunksz;
+    $chunksz = NPC21::Modbus::MAXLEN;  # full in npc21_modbus_update
+}
+
+# Issue CONF command to verify and activate the uploaded conf
+my $reply = $m->npc21(NPC21::Modbus::TAG_CONF, pack("a32", sha256($img)));
+if (my $err = NPC21::Modbus::error ($reply)) {
+    die "CONF command error: $err\n";
+}
+
+# Use CONFSTAT commands to wait for completion
+my $start = [gettimeofday];
+{ do {  # workaround for "last" in do{}while
+    last if tv_interval ($start) > $timeout;
+    $reply = $m->npc21(NPC21::Modbus::TAG_CONFSTAT, "");
+    if (my $err = NPC21::Modbus::error ($reply)) {
+        die "CONFSTAT command error: $err\n";
+    }
+} while ($reply =~ /pending/); }
+
+$reply =~ s/^.//;
+warn "Configuration status: $reply\n";
+
+$m->close();
+exit ($reply eq "OK"? 0:1);

@@ -1,0 +1,403 @@
+#!/usr/bin/perl
+
+# send commands and queries to Logic Box family PLC
+
+use strict; no strict 'subs';
+use Carp;
+use Data::Dumper;
+use Data::HexDump;
+use Digest::SHA qw(sha256);
+use MIME::Base64;
+use JSON;
+use POSIX;
+use Socket;  # for inet_ntoa
+use Time::HiRes qw(sleep gettimeofday tv_interval);
+my $basedir;
+BEGIN {
+    # find the base directory path, assuming this script is
+    # started as /path/to/basedir/host/script
+    # or /path/to/basedir/bin/script
+    $basedir = ($0 =~ m,^(/.+)/([^/]+)/[^/]+$,? $1: # /path/bin/script
+                $0 =~ m,^\./[^/]+$,? (getcwd =~ m,^(.*)/([^/]+),, $1):
+                $0 =~ m,^()([^/]+)/[^/]+$,? getcwd: # bin/script
+                $0 =~ m,^(.+)/([^/]+)/[^/]+$,? (`cd $1; pwd`): # ../bin/script
+                die "could not infer basedir from $0");
+    chomp $basedir;
+    unshift @INC, "$basedir/$2/MBclient/lib";
+    unshift @INC, "$basedir/$2";
+};
+use NPC21::Conf;
+use NPC21::Modbus;
+
+
+sub usage {
+    die
+        ("Usage: atcmd PLCNAME[/SLOT] [SECONDS] [-x|--hex] [-b|--bin] VAR [VAR...]\n",
+         "       atcmd PLCNAME[/SLOT] [SECONDS] VAR=VAL [VAR=VAL...]\n",
+         "       atcmd PLCNAME[/SLOT] [SECONDS] [-F|--force] VAR=VAL [VAR=VAL...]\n",
+         "       atcmd PLCNAME[/SLOT] [SECONDS] [-U|--unforce] VAR [VAR...]\n",
+#         "       atcmd PLCNAME[/SLOT] --abort\n",
+         "       atcmd PLCNAME[/SLOT] --calibrate SPEC\n",
+         "       atcmd PLCNAME[/SLOT] --fboot FILE\n",
+         "       atcmd PLCNAME[/SLOT] --getconf\n",
+         "       atcmd PLCNAME[/SLOT] --json\n",
+         "       atcmd PLCNAME[/SLOT] --nofboot\n",
+         "       atcmd PLCNAME[/SLOT] --restart {10s|1h|...}\n",
+         "       atcmd PLCNAME[/SLOT] --settime[=SECONDS]\n",
+         "       atcmd PLCNAME[/SLOT] --stats\n",
+         "       atcmd PLCNAME[/SLOT] [-v] [-f conffile.yml] [--bymac [-i ethN]] ...\n",
+         "");
+}
+
+my $conffile = "$basedir/conf/conf.yml";
+my $timeout = 10;  # seconds
+my $plc_name;
+my $plc_slot;
+my $plc_slot2;
+my $lan_slot;  # access PLC via LAN port in this slot
+my $bymac; # use IPv6 even if static ipaddr is present in conf.yml
+my $iface; # if not specified, will try all ifaces in parallel
+my $seconds;
+my $dump_json; # output config as JSON and terminate
+my $verbose;
+my %val;
+my @order;  # to output vars in the same order as in cmdline
+my %req;
+my $hex;    # output all var values in HEX
+my $bin;    # output all var values in BINARY
+
+$SIG{PIPE} = sub {die "got SIGPIPE, probably Modbus connection failed\n"};
+
+sub parse_args {
+    while (local $_ = shift @ARGV) {
+        if (/^([a-z][.\w]+)(:(-?\d+))?(\/(-?\d+)(\/(\d+))?)?$/i && !$plc_name) {
+            $plc_name = $1;
+            $plc_slot = $5;
+            $plc_slot2 = $7;
+            $lan_slot = $3;
+        }
+        elsif (/^([a-z][.\w]+)\/all$/i && !$plc_name) {
+            $plc_name = $1;
+            $plc_slot = "ALL";
+        }
+        elsif (/^--bymac$/) {
+            $bymac = 1;
+        }
+        elsif (/^-i(\S*)$/) {
+            $iface = $1 || shift @ARGV // usage();
+        }
+        elsif (/^--settime(=(\d+))?$/) {
+            # plc expects a string, not a number
+            $req{settime} = "" . ($2 || time());
+        }
+        elsif (/^--(abort|getconf|stats)$/) {
+            $req{$1} = 1;
+        }
+        elsif (/^--calibrate$/) {
+            my $spec = (shift @ARGV) // usage();
+            $req{calibrate} = $spec;
+        }
+        elsif (/^--fboot$/) {
+            my $file = (shift @ARGV) // usage();
+            -f $file || $file eq "-" || die "fboot file $file does not exist\n";
+            $req{fboot} = `cat $file`; $? == 0 or die "$?";
+            if ($req{fboot} =~ /\0/) {
+                die "--fboot: ASCII file expected\n";
+            }
+        }
+        elsif (/^--nofboot$/) {
+            $req{nofboot} = 1;
+        }
+        elsif (/^--restart$/) {
+            $req{restart} = (shift @ARGV) // usage();
+        }
+        elsif (/^\d+(\.\d*)?$/i && !$seconds) {
+            $seconds = $_;
+        }
+        elsif (/^-f(.*)$/) {
+            $conffile = $1 || (shift @ARGV) // usage();
+        }
+        elsif (/^--json(2?)$/) {
+            $dump_json = $1 || 1;
+        }
+        elsif (/^-t(.*)$/) {
+            $timeout = $1 || (shift @ARGV) // usage();
+        }
+        elsif (/^-F$/ || /^--force$/) {
+            $req{force} = {};
+        }
+        elsif (/^-U$/ || /^--unforce$/) {
+            $req{unforce} = {};
+        }
+        elsif (/^-v$/) {
+            $verbose = 1;
+        }
+        elsif (/^-vv$/) {
+            $verbose = 2;
+        }
+        elsif (/^-x$/ || /^--hex$/) {
+            $hex = 1;
+        }
+        elsif (/^-b$/ || /^--bin$/) {
+            $bin = 1;
+        }
+
+        elsif (/^([\w.]+?)(\d+)\.\.(\d+)=(\d+(\.\d*)?)$/ ||
+               /^([\w.]+?)(\d+)\.\.(\d+)=(\w+)$/) {
+            my ($stem, $lo, $hi, $val) = ($1, $2, $3, $4);
+            $lo <= $hi or die "invalid var range";
+            for ($lo .. $hi) {
+                $val{"$stem$_"} = $val;
+                push @order, "$stem$_";
+            }
+        }
+        elsif (/^([\w.]+)=(\d+(\.\d*)?)$/ ||
+               /^([\w.]+)=(\w+)$/i) {  # e.g. sys.trace=f1000
+            $val{$1} = $2;
+            push @order, $1;
+        }
+
+        elsif (/^([\w.]+?)(\d+)\.\.(\d+)$/) {
+            my ($stem, $lo, $hi) = ($1, $2, $3);
+            $lo <= $hi or die "invalid var range";
+            for ($lo .. $hi) {
+                $val{"$stem$_"} = "";
+                push @order, "$stem$_";
+            }
+        }
+        elsif (/^([\w.]+)$/) {
+            $val{$1} = "";
+            push @order, $1;
+        }
+        else {
+            usage ();
+        }
+    }
+
+    usage unless $plc_name || $dump_json;
+    usage unless %val || %req || $dump_json;
+    usage if $iface && !$bymac;
+}
+
+
+parse_args();
+my $tree = NPC21::Conf::load($conffile);
+#die Dumper $tree;
+
+if ($dump_json) {
+    my $json = JSON->new->canonical(1)->pretty(1)->space_before(0);
+    if ($dump_json == 2) { # for at241EA main/include/conf_builtin.h
+        $tree = $tree->{(keys %$tree)[0]};
+        $plc_name = "";
+    }
+    print $json->encode($plc_name? {$plc_name => $tree->{$plc_name}}: $tree);
+    exit (0);
+}
+
+if (! $tree->{$plc_name}) {
+    die "$conffile: no PLC `$plc_name'\n";
+}
+$tree->{$plc_name}{hostname} //= $plc_name;
+
+my $ipaddr = ($tree->{$plc_name}{ipaddr} =~ s/\/\d+//r);  # static IP, optional
+my $macaddr = NPC21::Conf::macaddr ($tree, $plc_name, $lan_slot);
+
+if ($bymac) {
+    $ipaddr = undef;
+}
+
+for my $var (keys %val) {
+    if ($val{$var} eq "") {
+        $req{$req{unforce}? "unforce": "get"}{$var} = "";
+    }
+    else {
+        usage if $req{unforce};
+        $req{$req{force}? "force": "set"}{$var} = $val{$var};
+    }
+}
+
+my @slotlist = ($plc_slot);     # undef OK
+if ($plc_slot && $plc_slot eq ALL) {
+    my $atcmd = $0;
+    my $atlog = $atcmd =~ s/cmd$/log/r;
+    system ($atcmd, $plc_name, "sys.bustab=1") == 0
+        or die "subprocess exit code $?";
+    open (my $fh, "$atlog $plc_name -1000r bustab_dump |");
+    my %bustab;
+    while(<$fh>) {
+        # I (09:12:57.808) bustab_dump1:75: f412fad551bb adc=0 rank=-1 BM
+        if (/bustab_dump1.*rank=(-?\d+)/) {
+            $bustab{$1} = "";
+        }
+    }
+    @slotlist = keys %bustab;
+}
+
+
+sub do_req {
+    my ($plc_slot, $prefix) = @_;
+
+    my $json = JSON->new->canonical([ENABLE]); # canonical == sorted keys
+    my $img = $json->encode(\%req);
+    my $m = NPC21::Modbus->new(
+        HOST => ($ipaddr || $macaddr),
+        IFACE => $iface,
+        SLOT => $plc_slot,
+        SLOT2 => $plc_slot2,
+        ABORT => $req{abort},
+        VERBOSE => ($verbose == 2),
+        );
+
+    my $req = pack("a32a*", sha256($img), $img);
+    my $maxsz = NPC21::Modbus::MAXLEN; # full in npc21_modbus_update
+    $maxsz -=3 if defined $plc_slot; # NPC21_MODBUS_TAG_SLOT overhead
+    $maxsz -=3 if defined $plc_slot2;
+    warn HexDump($req) if $verbose == 1;
+    if (length($req) > $maxsz) {
+        my $piece = substr ($req, $maxsz, $maxsz-4);
+        substr ($req, $maxsz, $maxsz-4) = "";
+        my $req1 = pack("Na*", length($req), $piece);
+        my $reply = $m->npc21(NPC21::Modbus::TAG_START, $req1);
+        if (my $err = NPC21::Modbus::error($reply)) {
+            die "error: $err\n";
+        }
+
+        while (length($req) > $maxsz) {
+            my $piece = substr ($req, $maxsz, $maxsz);
+            substr ($req, $maxsz, $maxsz) = "";
+            my $reply = $m->npc21(NPC21::Modbus::TAG_UPDATE, $piece);
+            if (my $err = NPC21::Modbus::error($reply)) {
+                die "error: $err\n";
+            }
+        }
+    }
+
+    # Issue CMDS command
+    my $reply = $m->npc21(NPC21::Modbus::TAG_CMDS, $req);
+    warn HexDump($reply) if $verbose;
+    my $err = NPC21::Modbus::error ($reply);
+    if ($err) {
+        if (unpack("C", $reply) == 255) { # err 255 returned for broadcast requests
+            warn "$err\n";
+            exit 0;
+        }
+        die "CMDS command: $err\n";
+    }
+
+    if (length ($reply) < 1+256/8) {
+        die "CMDS command: unexpected short reply: ", length ($reply), "\n";
+    }
+
+    if ($m->npc21_len() > NPC21::Modbus::MAXLEN) { # sign: there is a continuation
+        my $reply2;
+        do {
+            $reply2 = $m->npc21(NPC21::Modbus::TAG_MORE, pack("N", length($reply)));
+            if (my $err = NPC21::Modbus::error ($reply2)) {
+                die "MORE command: $err\n";
+            }
+            $reply .= substr($reply2, 1);
+        } while (length ($reply2) == NPC21::Modbus::MAXLEN);
+    }
+
+    my (undef, $digest, $body) = unpack ("Ca32a*", $reply);
+    if (sha256($body) ne $digest) {
+        warn HexDump($reply) unless $verbose;
+        die "CMDS command: reply sha256 check failed\n";
+    }
+
+    my $output_lines = 0;
+    my $hh = decode_json ($body);
+    if ($hh->{get}) {
+        print strftime("%F %T", localtime);
+        printf (".%03u ", (gettimeofday)[1]/1e6*1000);
+        for my $varname (keys %{$hh->{get}}) {
+            local $_ = $hh->{get}{$varname};
+            if (s/^=\?application\?B\?//) {
+                s/\?=$//;
+                my $bin = decode_base64($_);
+                $hh->{get}{$varname} = "\n" . HexDump($bin);
+            }
+        }
+        my @out;
+        for (@order) {
+            next unless exists $hh->{get}{$_};
+            my $val = $hh->{get}{$_};
+            if ($val =~ /^-?\d[-\d.e]*$/i) { # number
+                my $n = $hh->{get}{$_};
+                if ($hex) {
+                    push @out, sprintf("$_=0x%x", $n);
+                }
+                elsif ($bin) {
+                    my $x = sprintf("%032b", $n);
+                    $x =~ s/(....)/_$1/g;
+                    $x =~ s/_//;
+                    push @out, sprintf("$_=$x", $n);
+                }
+                else {
+                    push @out, sprintf("$_=%g", $n);
+                }
+            }
+            else {              # string
+                push @out, "$_=$val";
+            }
+            delete $hh->{get}{$_};
+        }
+        # just in case something unexpected is left there
+        push @out, map {"$_=$hh->{get}{$_}"} sort keys %{$hh->{get}};
+        print "${prefix}@out\n";
+        $output_lines++;
+    }
+
+    if ($hh->{stats}) {
+        for (sort keys %{$hh->{stats}}) {
+            if (ref $hh->{stats}{$_}) {
+                print "${prefix}$_ = @{$hh->{stats}{$_}}\n";
+            }
+            else {
+                print "${prefix}$_ = $hh->{stats}{$_}\n";
+            }
+            $output_lines++;
+        }
+    }
+
+    if (my $str = $hh->{getconf}) {
+        my $conf = decode_json ($str);
+        if (my $hostname = $conf->{hostname}) {
+            delete $conf->{hostname};
+            $conf = {$hostname => $conf};
+        }
+        print YAML::Dump($conf);
+        $output_lines += 100;   # >1, don't bother counting
+    }
+
+    if ($hh->{calibrate}) {
+        print "${prefix}Calibration status: $hh->{calibrate}\n";
+    }
+    $m->close();
+
+    return $output_lines;
+}
+
+
+do {
+    my $output_lines;
+    for my $plc_slot (sort {$a <=> $b} @slotlist) {
+        my $prefix = (@slotlist >1? sprintf("%2d ", $plc_slot): "");
+        $output_lines = eval {do_req ($plc_slot, $prefix)};
+        if ($@) {
+            if (@slotlist) {
+                die "${prefix}$@";
+            }
+            else {
+                warn $@;
+            }
+        }
+    }
+    if ($seconds) {
+        print "\n" if $output_lines > 1;
+        sleep ($seconds);
+    }
+} while ($seconds);
+
+
+exit 0;

@@ -1,0 +1,277 @@
+#!/usr/bin/perl
+
+# compile & upload PLC program in ST language to LogicBox PLC
+
+use strict; no strict 'subs';
+use Carp;
+use YAML;
+use JSON;
+use POSIX;
+use Data::Dumper;
+use Digest::SHA qw(sha256);
+my $basedir;
+BEGIN {
+    # find the base directory path, assuming this script is
+    # started as /path/to/basedir/host/script
+    # or /path/to/basedir/bin/script
+    $basedir = ($0 =~ m,^(/.+)/([^/]+)/[^/]+$,? $1: # /path/bin/script
+                $0 =~ m,^\./[^/]+$,? (getcwd =~ m,^(.*)/([^/]+),, $1):
+                $0 =~ m,^()([^/]+)/[^/]+$,? getcwd: # bin/script
+                $0 =~ m,^(.+)/([^/]+)/[^/]+$,? (`cd $1; pwd`): # ../bin/script
+                die "could not infer basedir from $0");
+    chomp $basedir;
+    unshift @INC, "$basedir/$2/MBclient/lib";
+    unshift @INC, "$basedir/$2";
+};
+use NPC21::Conf;
+use NPC21::Modbus;
+
+
+sub usage {
+    confess ("Usage: atupload PLCNAME progN\n",
+         "       atupload PLCNAME progN -c\n",
+#        "       atupload PLCNAME progN -cc\n",  /*undocumented*/
+         "       atupload -c [path_to/]FILENAME.st\n",
+         "       atupload [-f conffile.yml] ...\n");
+}
+
+
+my $plc_name;
+my $lan_slot;  # access PLC via LAN port in this slot
+my $progn;
+my $compile_only; # disable upload
+my $srcfile;
+my $conffile = "$basedir/conf/conf.yml";
+my $same_size_workaround;
+
+
+sub parse_args {
+    while (defined (local $_ = shift @ARGV)) {
+        if (/^([a-z][.\w]+)(:(\d+))?$/i && !$plc_name) {
+            $plc_name = $1;
+            $lan_slot = $3;
+        }
+        elsif (/^(prog)?(\d+)$/ && ! defined $progn) {
+            $progn = $2;
+        }
+        elsif (/^prog$/ && ! defined $progn) {
+            $progn = 0;
+        }
+        elsif (/^-cc$/) {
+            $compile_only = 2;
+        }
+        elsif (/^-c$/) {
+            $compile_only = 1;
+            if (@ARGV) {
+                $srcfile = shift @ARGV;
+                $srcfile =~ s/^/getcwd . "\/"/e unless $srcfile =~ /^\//;
+            }
+        }
+        elsif (/^-f(.*)$/) {
+            $conffile = $1 || shift @ARGV;
+        }
+        else {
+            usage ();
+        }
+    }
+    return if $compile_only && $srcfile;
+    usage unless $plc_name;
+    usage unless defined $progn;
+}
+
+
+$SIG{PIPE} = sub {die "got SIGPIPE, probably Modbus connection failed\n"};
+
+parse_args();
+
+if ($compile_only && $srcfile) {
+    goto compile;
+}
+
+my $tree = NPC21::Conf::load($conffile);
+#die Dumper $tree;
+if (! $tree->{$plc_name}) {
+    die "$conffile: no PLC `$plc_name'\n";
+}
+
+$tree->{$plc_name}{hostname} //= $plc_name;
+
+my $ipaddr = ($tree->{$plc_name}{ipaddr} =~ s/\/\d+//r);  # static IP, optional
+my $macaddr = NPC21::Conf::macaddr ($tree, $plc_name, $lan_slot);
+my $m = NPC21::Modbus->new(HOST => ($ipaddr || $macaddr));
+
+# determine the target architecture (AT241 -> ESP32s3, AT340 -> ESP32)
+my $arch;
+for (keys %{$tree->{$plc_name}}) {
+    if (/^slot-?\d+$/) {
+        if (my $module = $tree->{$plc_name}{$_}{"module"}) {
+            my $prev = $arch;
+            $arch = "xtensa-esp32s3-elf" if $module =~ /^bcbase/;
+            $arch = "xtensa-esp32s3-elf" if $module =~ /^AT241/;
+            $arch = "xtensa-esp32-elf" if $module =~ /^LB340/;
+            if ($prev && $arch ne $prev) {
+                die "$_: $module: inconsistent with another slot\n";
+            }
+        }
+    }
+}
+$arch or die ("$conffile: $plc_name: cannot determine CPU arch from",
+              " 'module' attributes\n");
+
+# find scrfile by progn in conf.yml
+for (keys %{$tree->{$plc_name}}) {
+    next unless /^task\d+$/ || /^on_stop$/;
+    if ($tree->{$plc_name}{$_}{"prog$progn"}) {
+        $srcfile = $tree->{$plc_name}{$_}{"prog$progn"}{file}
+        or die "$conffile: prog$progn: missing `file' attribute\n";
+        last;
+    }
+}
+
+defined $srcfile or die "$conffile: $plc_name: missing `prog$progn'\n";
+if ($srcfile !~ /^\//) {
+    $srcfile = "$basedir/st/$srcfile";
+}
+-f $srcfile or die "$srcfile: $!\n";
+
+
+compile:
+my $dir = "$basedir/st";
+$arch //= "xtensa-esp32s3-elf";  # for -c srcfile
+my ($textsz, $datasz, $bsssz) = do {
+    my $cmd = "make -C$dir ARCH=$arch SRC=$srcfile size";
+    warn "$cmd\n";
+    local $_ = `$cmd`;
+    $? == 0 or exit ($?>>8);    # make already reported the error
+    /(\d+)\s+(\d+)\s+(\d+)/;
+};
+
+$textsz = ($textsz+3) & ~3;  # round up to x4 boundary
+$datasz = ($datasz+7) & ~7;  # round up to x8 boundary
+$bsssz  = ($bsssz+7) & ~7;   # round up to x8 boundary
+
+warn "segment sizes: textsz=$textsz datasz=$datasz bsssz=$bsssz\n";
+if ($compile_only && $compile_only != 2) {
+    exit 0;
+}
+
+
+same_size_retry:
+if ($same_size_workaround) {
+    $textsz += 4;
+}
+
+my $req = pack("NNNN"."NNNN", $progn, $textsz, $datasz, $bsssz, 0,0,0,0);
+my $reply = $m->npc21(NPC21::Modbus::TAG_GETPLACE, $req);
+if (my $err = NPC21::Modbus::error ($reply)) {
+    die "GETPLACE: $err\n";
+}
+my ($err, undef, undef, undef, undef,
+    $text_offset, $text, $data, $bss,
+    $tdigest, $ddigest) = unpack("CNNNN"."NNNNa32a32", $reply);
+warn sprintf("GETPLACE returned text=0x%08x data=0x%08x bss=0x%08x\n",
+             $text, $data, $bss);
+#if ($tdigest) {
+#    warn "found digests in the reply -- the program may be already uploaded...\n";
+#}
+
+if ($data & 7) {
+    die "$data not aligned to x8: $data"
+}
+for ($text, $data, $bss) {
+    $_ = sprintf("0x%08x", $_);
+}
+
+my @cmd = ();
+push @cmd, "make -C$dir ARCH=$arch SRC=$srcfile";
+push @cmd, "TEXT_START=$text DATA_START=$data BSS_START=$bss binary";
+#push @cmd, "> $dir/build/make.out 2>&1";
+warn "@cmd\n";
+system("@cmd");
+#$? == 0 or die "Compilation command: @cmd\nFailed, see $dir/build/make.out\n";
+$? == 0 or die "\n";
+
+# concatenate text.bin and data.bin, make sure data.bin is at
+# offset=textsz (whereas text.bin may turn out shorter than textsz
+# because of linker optimizations)
+my $file = "$dir/build/text.bin";
+open(my $fh, $file) or die "$file: $!\n";
+sysread($fh, my $text_img, 1e6) == -s $file
+    or die "$file: too big or I/O error\n";
+if (length($text_img) < $textsz) {
+    $text_img .= "\0" x ($textsz - length($text_img));
+}
+die unless length($text_img) == $textsz;
+
+$file = "$dir/build/data.bin";
+open($fh, $file) or die "$file: $!\n";
+sysread($fh, my $data_img, 1e6) == -s $file
+    or die "$file: too big or I/O error\n";
+if (length($data_img) < $datasz) {
+    $data_img .= "\0" x ($datasz - length($data_img));
+}
+
+#$file = "$dir/build/debug.bin";
+#open($fh, ">$file") or die "$file: $!\n";
+#syswrite($fh, $img);
+
+if ($tdigest) {
+    if (sha256($text_img) eq $tdigest &&
+        sha256($data_img) eq $ddigest) {
+        warn ("$srcfile is already uploaded as plcprog$progn\n");
+        exit (0);
+    }
+    # digests present in the reply == same sizes, but the program is
+    # different.  Module firmware does not allow to load as is
+    # (getplace returned addresses of the old prog to facilitate the
+    # check above).  Increase .text size by a dummy word and retry
+    die if $same_size_workaround; # "cannot happen", but guard against a loop
+    warn "using same_size_workaround...\n";
+    $same_size_workaround = 1;
+    goto same_size_retry;
+}
+
+if ($compile_only) {  # -cc
+    exit 0;
+}
+
+#warn "text_img length @{[length $text_img]} $textsz";
+#warn "data_img length @{[length $data_img]} $datasz";
+#printf STDERR "OK? "; <STDIN>;
+
+my $offset = 0;
+my $chunksz = NPC21::Modbus::MAXLEN - 4; # shorter in npc21_modbus_start
+my $img = $text_img . $data_img;
+while (my $piece = substr($img, $offset, $chunksz)) {
+    warn "chunk upload: @{[length $piece]}\@$offset\n";
+    my $reply;
+    if ($offset == 0) {
+        my $pktlen = pack("N", length $img);
+        $reply = $m->npc21(NPC21::Modbus::TAG_START, $pktlen.$piece);
+    }
+    else {
+        $reply = $m->npc21(NPC21::Modbus::TAG_UPDATE, $piece);
+    }
+    defined $reply or die "internal error: Modbus request not sent";
+    if (my $err = NPC21::Modbus::error ($reply)) {
+        die "chunk upload error: $err\n";
+    }
+    $offset += $chunksz;
+    $chunksz = NPC21::Modbus::MAXLEN;  # full in npc21_modbus_update
+}
+
+# Issue PLCPROG command to verify and activate the uploaded image
+$req = pack("NNNN"."NNNN", $progn, $textsz, $datasz, $bsssz,
+             $text_offset, hex($text), hex($data), hex($bss),
+             0,0,0,0);
+$req .= sha256($text_img);
+$req .= sha256($data_img);
+$reply = $m->npc21(NPC21::Modbus::TAG_PLCPROG, $req);
+if (my $err = NPC21::Modbus::error ($reply)) {
+    die "PLCPROG command error: $err\n";
+}
+
+warn "OK uploaded prog$progn from $srcfile\n";
+
+$m->close();
+exit 0;

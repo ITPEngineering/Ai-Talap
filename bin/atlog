@@ -1,0 +1,197 @@
+#!/usr/bin/perl
+
+# upload YAML config to Logic Box family PLC
+
+use strict; no strict 'subs';
+use Carp;
+use Data::Dumper;
+use Digest::SHA qw(sha256);
+use JSON;
+use POSIX;
+use Socket;  # for inet_ntoa
+use Time::HiRes qw(sleep gettimeofday);
+use YAML;
+my $basedir;
+BEGIN {
+    # find the base directory path, assuming this script is
+    # started as /path/to/basedir/host/script
+    # or /path/to/basedir/bin/script
+    $basedir = ($0 =~ m,^(/.+)/([^/]+)/[^/]+$,? $1: # /path/bin/script
+                $0 =~ m,^\./[^/]+$,? (getcwd =~ m,^(.*)/([^/]+),, $1):
+                $0 =~ m,^()([^/]+)/[^/]+$,? getcwd: # bin/script
+                $0 =~ m,^(.+)/([^/]+)/[^/]+$,? (`cd $1; pwd`): # ../bin/script
+                die "could not infer basedir from $0");
+    chomp $basedir;
+    unshift @INC, "$basedir/$2/MBclient/lib";
+    unshift @INC, "$basedir/$2";
+};
+use NPC21::Conf;
+use NPC21::Modbus;
+
+
+sub usage {
+#    die
+    confess
+        ("Usage: atlog PLCNAME [[-eirsv] REGEX ...] [-N] [-f]\n",
+         "     REGEX is a POSIX regular expression (man 7 regex)\n",
+         "     N is the number of most recent records to fetch\n",
+         "     -e use POSIX Extended Regular Expression syntax\n",
+         "     -f `follow' mode, like tail -f\n",
+         "     -i ignore case\n",
+         "     -r output in reverse chronological order\n",
+         "     -s let '.' match newline (\\n)\n",
+         "     -v invert match result, like grep -v\n",
+         "");
+}
+
+
+my $conffile = "$basedir/conf/conf.yml";
+my $plc_name;
+my $plc_slot;
+my $plc_slot2;                  # plc_name/plc_slot/plc_slot2
+my $lan_slot;                   # access PLC via LAN port in this slot
+my $follow;                     # -f specified
+my $reverse;                    # -r specified
+my $lines;                      # undef=no limit (or no -f prefetch)
+my @flags_regexs;               # data for LOGGREP command
+my @flags;                      # collected for the next regex
+my $m;   # MBclient; declare here for use in exit_if_eof_unless_follow
+my $matches_found;
+
+$SIG{PIPE} = sub {
+    # Suppress final error in this case:
+    # host/getlog bc3 | head
+    # ...
+    # Unable to flush stdout: Broken pipe
+    if ($matches_found) {
+        close (STDOUT);
+        exit 0;
+    }
+    die "got SIGPIPE, probably Modbus connection failed\n";
+};
+
+
+sub parse_args {
+    while (defined ($_ = shift @ARGV)) {
+        if (!$plc_name && s/^([a-z][.\w]+)(:(\d+))?(\/(-?\d+))?(\/(-?\d+))?$//i) { # order!
+            $plc_name = $1;
+            $plc_slot = $5;
+            $plc_slot2 = $7;
+            $lan_slot = $3;
+        }
+        elsif (s/^-(\d+)//) {
+            defined $lines && die "duplicate line count (-$lines seen)\n";
+            $lines = $1;
+        }
+        elsif (s/^-([eisv])//) {  # per-regexp flags
+            push @flags, $1;
+        }
+        elsif (s/^-([f])//) {   # global flags
+            $follow = 1;
+        }
+        elsif (s/^-([r])//) {   # global flags
+            $reverse = 1;
+        }
+        elsif (s/^([^-].*)$//) {
+            push @flags_regexs, join ("", @flags);
+            push @flags_regexs, $1;
+            @flags = ();
+        }
+        else {
+            usage ();
+        }
+
+        if ($_ ne "") {
+            unshift @ARGV, "-$_";
+        }
+    }
+
+    usage unless $plc_name;
+    if ($follow && $reverse) {
+        die "either -f or -r please\n";
+    }
+}
+
+
+sub exit_if_eof_unless_follow {
+    my ($logdata) = @_;
+    if (! length($logdata)) {  # EOF reached
+        if ($follow) {
+            sleep (1);
+        }
+        else {
+            $m->close ();
+#confess "matches_found=$matches_found";
+            exit ($matches_found? 0:1);
+        }
+    }
+}
+
+
+parse_args();
+my $tree = NPC21::Conf::load($conffile);
+#die Dumper $tree;
+if (! $tree->{$plc_name}) {
+    die "$conffile: no PLC `$plc_name'\n";
+}
+$tree->{$plc_name}{hostname} //= $plc_name;
+
+my $ipaddr = ($tree->{$plc_name}{ipaddr} =~ s/\/\d+//r);  # static IP, optional
+my $macaddr = NPC21::Conf::macaddr ($tree, $plc_name, $lan_slot);
+
+$m = NPC21::Modbus->new(
+    HOST => ($ipaddr || $macaddr),
+    SLOT => $plc_slot,
+    SLOT2 => $plc_slot2,
+    );
+
+if (! @flags_regexs) { # no regex seen
+    push @flags, "a";   # take all
+    @flags_regexs = join("", @flags);
+}
+
+$flags_regexs[0] .= $lines if defined $lines;
+$flags_regexs[0] .= "r" if $reverse;
+$flags_regexs[0] .= "f" if $follow;
+my $data = join("\0", @flags_regexs);
+my $wait = 2;  # seconds; >=5 can give "timeout waiting reply from the slot"
+my $req = pack("Ca*", $wait*10, $data);
+my $reply = $m->npc21(NPC21::Modbus::TAG_LOGGREP, $req);
+
+if (my $err = NPC21::Modbus::error ($reply)) {
+    if ($err !~ /temporarily unavailable/) { # EAGAIN is normal, do LOGMORE
+        die "LOGGREP command: $err\n";
+    }
+}
+
+my (undef, $fd, $logdata) = unpack ("CCa*", $reply);
+#warn Dumper([$reply, $logdata]);
+exit_if_eof_unless_follow ($logdata);
+
+local $| = 1;
+local $_ = "";
+for (;;) {
+    $_ .= $logdata;
+    while (s/^(.+?)[\n\0]+//) {
+        print "$1\n";
+        $matches_found = 1;
+    }
+    my $req = pack("C", $fd);
+    my $reply = $m->npc21(NPC21::Modbus::TAG_LOGMORE, $req);;
+    if (my $err = NPC21::Modbus::error ($reply)) {
+        if ($err =~ /temporarily unavailable/) { # EAGAIN is normal
+            $logdata = "";
+            sleep 1;
+            next;
+        }
+        die "LOGMORE command: $err\n";
+    }
+    my $fd2;
+    (undef, $fd2, $logdata) = unpack ("CCa*", $reply);
+#warn Dumper([$reply, $logdata]);
+    exit_if_eof_unless_follow ($logdata);
+    $fd2 == $fd or die "protocol error, fd mismatch: $fd2 == $fd";
+}
+
+$m->close();
+exit 0;

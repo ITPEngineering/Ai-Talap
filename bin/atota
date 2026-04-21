@@ -1,0 +1,180 @@
+#!/usr/bin/perl
+
+# Over-the-air firmware upload to LogicBox series PLC
+
+use strict; no strict 'subs';
+use Carp;
+use YAML;
+use Net::hostent;
+use JSON;
+use POSIX;
+use Socket;  # for inet_ntoa
+use Time::HiRes qw(sleep);
+use Data::Dumper;
+use Data::HexDump;
+my $basedir;
+BEGIN {
+    # find the base directory path, assuming this script is
+    # started as /path/to/basedir/host/script
+    # or /path/to/basedir/bin/script
+    $basedir = ($0 =~ m,^(/.+)/([^/]+)/[^/]+$,? $1: # /path/bin/script
+                $0 =~ m,^\./[^/]+$,? (getcwd =~ m,^(.*)/([^/]+),, $1):
+                $0 =~ m,^()([^/]+)/[^/]+$,? getcwd: # bin/script
+                $0 =~ m,^(.+)/([^/]+)/[^/]+$,? (`cd $1; pwd`): # ../bin/script
+                die "could not infer basedir from $0");
+    chomp $basedir;
+    unshift @INC, "$basedir/$2/MBclient/lib";
+    unshift @INC, "$basedir/$2";
+};
+use NPC21::Conf;
+use NPC21::Modbus;
+
+
+sub usage {
+    die ("Usage: atota PLCNAME[/SLOT[/ADDR]] [--rewind] /path/to/firmware.bin\n",
+         "       atota ... [-f conffile.yml] ...\n");
+}
+
+
+my $plc_name;
+my $plc_slot;
+my $plc_slot2;
+my $lan_slot;  # access PLC via LAN port in this slot
+my $module_arg_full;
+my $otafile;
+my $rewind;
+my $conffile = "$basedir/conf/conf.yml";
+
+
+sub parse_args {
+    while (defined (local $_ = shift @ARGV)) {
+        if (/^([a-z][.\w]+)(:(\d+))?(\/(-?\d+))?(\/(-?\d+))?$/i && ! $plc_name) {
+            $plc_name = $1;
+            $plc_slot = $5;
+            $plc_slot2 = $7;
+            $lan_slot = $3;
+            $module_arg_full = $_;
+        }
+        elsif (/^-f(.*)$/) {
+            $conffile = $1 || shift @ARGV;
+        }
+        elsif (/^--rewind$/) {
+            $rewind = 1;
+        }
+        elsif (/^([^-].*)$/) {
+            $otafile = $1 || shift @ARGV;
+        }
+        else {
+            usage ();
+        }
+    }
+    usage unless $plc_name;
+    usage unless $otafile;
+}
+
+
+sub maybe_decompress
+{
+    local ($_) = @_;
+
+    /\.gz$/  && return "zcat < $_ |";
+    /\.bz2$/ && return "bzcat < $_ |";
+    /\.xz$/  && return "xzcat < $_ |";
+    /\.zst$/ && return "zstdcat < $_ |";
+
+    return $_;
+}
+
+
+$SIG{PIPE} = sub {die "got SIGPIPE, probably Modbus connection failed\n"};
+
+parse_args();
+my $tree = NPC21::Conf::load($conffile);
+#die Dumper $tree;
+if (! $tree->{$plc_name}) {
+    die "$conffile: no PLC `$plc_name'\n";
+}
+
+$tree->{$plc_name}{hostname} //= $plc_name;
+
+my $ipaddr = ($tree->{$plc_name}{ipaddr} =~ s/\/\d+//r);  # static IP, optional
+my $macaddr = NPC21::Conf::macaddr ($tree, $plc_name, $lan_slot);
+my $m = NPC21::Modbus->new(
+    HOST => ($ipaddr || $macaddr),
+    SLOT => $plc_slot,
+    SLOT2 => $plc_slot2,
+    );
+
+my $file = $otafile;
+open(my $fh, maybe_decompress($file)) or die "$file: $!\n";
+my $sz = read($fh, my $img, 2e6);
+defined ($sz) && $sz > 0
+    or die "$file: something wrong ($!)\n";
+
+sub ota_begin {
+    my ($image_length) = @_;
+    warn "OTA_BEGIN\n";
+    my $req = pack("N", $image_length);
+    my $reply = $m->npc21(NPC21::Modbus::TAG_OTA_BEGIN, $req);
+    if ($reply =~ /(now write at (\d+))/) {
+        warn "$1\n";
+    }
+    elsif (my $err = NPC21::Modbus::error ($reply)) {
+        die "OTA_BEGIN command error: $err\n";
+    }
+}
+
+
+sub ota_write {
+    my ($img) = @_;
+    my $retry = 0;
+    my $offset = 0;
+    my $chunksz = NPC21::Modbus::MAXLEN - 4; # 4 for "offset" field
+    $chunksz -=3 if defined $plc_slot;  # NPC21::Modbus::TAG_SLOT overhead
+    $chunksz -=3 if defined $plc_slot2;
+    while (my $piece = substr($img, $offset, $chunksz)) {
+        my $req = pack("Na*", $offset, $piece);
+        sleep (0.03) if defined $plc_slot;  # releave the stress on CANbus
+        my $reply = $m->npc21(NPC21::Modbus::TAG_OTA_WRITE, $req);
+        if ($reply =~ /(now write at (\d+))/) {
+            warn "$1\n";
+            $offset = $2;
+        }
+        elsif ($reply =~ /received whole image/) {
+            warn "$1\n";
+            return;
+        }
+        elsif (my $err = NPC21::Modbus::error ($reply)) {
+            if ($retry++ < 2) {
+                warn "OTA_WRITE command error: $err, retrying...\n";
+                sleep 1;
+                next;
+            }
+            else {
+                die "OTA_WRITE command error: $err\n";
+            }
+        }
+
+        $retry = 0;
+    }
+}
+
+sub ota_end {
+    my $reply = $m->npc21(NPC21::Modbus::TAG_OTA_END);
+    if (my $err = NPC21::Modbus::error ($reply)) {
+        die "OTA_END command error: $err\n";
+    }
+}
+
+
+ota_begin (0) if $rewind;
+ota_begin (length($img));
+ota_write ($img);
+ota_end ();
+
+my $atcmd = ($0 =~ s/ota/cmd/r);
+warn ("OTA finished successfully, ",
+      "now do $atcmd $module_arg_full sys.restart=1\n");
+
+$m->close();
+exit 0;

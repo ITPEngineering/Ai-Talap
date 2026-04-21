@@ -1,0 +1,575 @@
+# config for the whole distributed control system,
+# potentially comprising multiple PLCs
+#
+# This file (conf-full.yml) is a collection of all parameters for all
+# supported modules, sometimes conflicting.  It is not a working
+# config example.
+
+# configuration for PLC named `plc_botik1'
+plc1:
+  # mac address is mandatory for initial configuration
+  # and does no harm afterwards
+  macaddr: f4:12:fa:d4:d1:7f
+  # optional static IP configuration, inhibits DHCP
+  #ipaddr: 192.168.1.90/24
+  #gateway: 192.168.1.60
+
+  clock:
+    TZ: MSK
+    sntp_server: pool.ntp.org
+    sntp_server2: ntp.ix.ru
+    sntp_smooth: y  # y=use adjtime, n=use settimeofday
+
+  # watchdog timers reset base module or modules on the bus if not fed
+  # in time
+  wdt:
+    self: 30s # wdt timeout in base modules (default 3600s)
+    bus: 10s  # wdt timeout in i/o modules (default 300s)
+
+  # AO (analog output) module in slot #1
+  slot1:
+    module: AO
+    # 0-10V voltage output
+    out0: {mode: 0-10V , var_out: DAC1}
+    # 0-10V voltage output
+    out1: {mode: 0-10V , var_out: DAC2}
+    # 0-10V voltage output
+    out2: {mode: 0-10V , var_out: DAC3}
+    # current loop 4-20mA output
+    out3: {mode: 4-20mA, var_out: DAC4}
+
+  # AI (analog input) module in slot #2
+  slot2:
+    module: AI
+    # platinum Resistance thermometer
+    in0: {mode: Pt100-3wire, range:    1, var: ADC1} 
+    # thermocouple
+    in1: {mode: K          , range:   .1, var: ADC2}
+    # 0-10V voltage input
+    in2: {mode: 0-10V      , range:  .01, var: ADC3}
+    # current loop 4-20mA input
+    in3: {mode: 4-20mA     , range: .001, var: ADC4}
+
+  # DO (discrete output) module in slot #3
+  slot3:
+    module: DO
+    out0: {var_out: __QX0_0}
+    out1: {var_out: __QX0_1}
+    out12: {var_out: __QX0_1}
+
+    out31: {var_out: __QX1_0}
+    out32: {var_out: __QX1_0}
+    out41: {var_out: __QX1_1}
+    out42: {var_out: __QX1_1}
+
+    out52: {var_out: testDI}
+    out56: {var_out: testDI}
+    out60: {var_out: testDI}
+
+    out53: {var_out: testDI2}
+    out57: {var_out: testDI2}
+    out61: {var_out: testDI2}
+
+    out62: {init: 1}
+
+  # DI (discrete input) module in slot #5
+  slot5:
+    module: DI
+    # multi-line YAML syntax
+    in0:
+      var: testDI
+      period: 30s
+      interval: 3s
+      filter: 3ms
+    # alternative single-line YAML syntax
+    in63: {var: testDI2, period: 30s, interval: 0, filter: 3s}
+
+  slot6:
+    module: com
+
+    # port 0 parameters.  Optional, defaults shown below
+    rs485:
+      speed: 9600
+      parity: N
+      bits: 8
+      stop_bits: 1
+      #termination: 120  # optional; 100 or 120 or 680 Ohm
+      #pullup: enable    # optional: enable/disable
+
+    # port 1 parameters.  Optional too
+    rs485_1:
+      #speed: 9600
+      # ...
+
+    # Modbust RTU server enabled on port 0 with RTU address 1 and on
+    # port 1 with RTU addess 100.  Both ports share the same register
+    # space.
+    modbus_server:
+      rtu_addr: 1    # on RS485 port 0
+      #rtu_addr_1: 100 # on RS485 port 1
+      coil0: {var: msc0}
+      inbit10: {var_out: msb10}
+      inreg10: {var_out: msr10}
+      holding100+5: {var: msh100+5}
+      fussy_read: y  # return exception if undeclared reg is read
+      fussy_write: y # return exception if undeclared reg is written
+      interframe_gap: 4ms    # on RS485 port 0
+      #interframe_gap_1: 4ms  # on RS485 port 1
+
+    # clients on port 0
+    # Multiple clients ok, but server on the same port disallowed
+    modbus_client:
+      addr: 110
+      inreg10: {var: myvar1, period: 5s}
+
+    modbus_client222: # the "222" suffix only resolves name conflict
+      addr: 120
+      inbit0..5: {var: myvar11..16, period: 1s}
+      inreg1..2: {var: i12, period: 5s, type: dword, order: dcba}
+
+    # flood RS-485 with meaningless (non-Modbus) test data.
+    # Sends dense stream with almost no delay between portions.
+    # addr is formally required but unused.
+    modbus_client1000:
+      addr: 1
+      test_pattern: "UUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUU"
+
+    # clients on port 1
+    # Multiple clients ok, but server on the same port disallowed
+    modbus_client_1:
+      addr: 25
+      # write holding registers 10 and 11 every 900ms
+      holding10+1: {var_out: myvar123+1, period: 0.9s}
+
+    modbus_client2_1:
+      addr: 26
+      # write holding registers 10 and 11 every 900ms
+      #holding10+1: {var_out: myvar123+1, period: 0.9s}
+
+
+
+  slot7:
+    module: net-104
+    server1:  # "1" becomes the "common address" (CA) of the server
+
+      # 2404 is the default
+      #tcp_port: 2404
+
+      # max simultaneous client connections, 10 is the default
+      #max_connections: 10
+
+      # optional: accept only these clients
+      #allow: [192.168.1.60, 192.168.1.61]
+
+      # connection level parameters (APCIP)
+      conn_parms:
+        k: 12  # max number of APDUs to send until waiting for ack
+        w: 8   # receiver will ack after receiving `w' APDUs (w <= 2k/3).
+        t0: 10s # connection establishment timeout
+        t1: 15s # timeout waiting for ack from receiver
+        t2: 10s # receiver will ack after t2
+        t3: 20s # transmit keepalive message if idle for t3
+
+      # application level parameters.
+      #app_parms:
+      #  type_id_size: 1
+      #  vsq_size: 1
+      #  cot_size: 2
+      #  originator_address: 0
+      #  ca_size: 1
+      #  ioa_size: 3
+      #  asdu_maxsize: 249
+
+      # C_CS_NA_1(103) | Clock synchronization command
+      clock_sync:
+        period: 0 # never send clock synchronization command
+        timeout: 1h # renders clock invalid if not updated for this long
+
+      #
+      # information objects specify mapping from variable namespace
+      # ioN:, where N in 0..16777215.
+      #
+      # ioN are recievers (have var: attribute) and accept both
+      # measurement and control messages.
+      #
+      # measN are senders (var_out:) that send `measurement' messages.
+      #
+      # commandN are senders (var_out:) that send command messages
+      #
+
+      # M_ME_TF_1(36) Short measured value (FLOAT32) with CP56Time2a
+      # No periodic or spontaneous transmission configured (neither
+      # period: nor interval: present), so this object is only
+      # accessible by read requests or interrogations.
+      meas5000:
+        var_out: myvar1
+        # supported types: singlepoint doublepoint stepposition
+        #                  bitstring normalized scaled float integrated
+        type: float
+        # supported time formats: auto (default), 56 (CP56Time2A), none
+        # "auto" means "none" in polling, "56" in periodic/spontaneous
+        time: 56
+
+      # M_ME_TF_1(36) Short measured value (FLOAT32) with CP56Time2a
+      # variable transmitted "spontaneously" upon change, if the
+      # change is larger than +-0.05, and not more often than once a
+      # second
+      meas70:
+        var_out: myvar20
+        type: float
+        range: 0.05
+        interval: 1s
+
+      # M_BO_TB_1(33) | Bitstring32 (32 bit bitstring) with CP56Time2a
+      # The object is sent spontaneously upon change (because
+      # `interval' is present), but not more often than once a second.
+      # The object is also sent periodically (every 3 minutes),
+      # but not if there was a spontaneous transmission recently
+      # (witnin `interval). `range' is usually unnecessary for
+      # discrete variables, but is honored if specified.
+      meas71: {var_out: myvar30, type: bitstring, interval: 1s, period: 3m}
+
+      # C_SC_TA_1(58) | Single command (BOOLEAN) with CP56Time2a
+      # When this command comes from a client, we write the value to
+      # `myvar40' and forward it to PLC bus master -- but not more often
+      # than once in 100ms
+      io160000: {var: myvar40, type: singlepoint, interval: 0.1s}
+
+      # C_BO_TA_1(64) | Bitstring command (32 bit bitstring) with CP56Time2a
+      # control direction.  When written by a client, stored in
+      # net-104 module, but not forwarded to PLC bus master (because
+      # no `interval' is given).  Can be retrieved by clients with
+      # read or interrogation.
+      io16: {var: myvar41, type: bitstring}
+
+      # C_IC_NA_1(100) | Interrogation command
+      # Can send and receive
+      # This is a "general interrogation" (qoi=20)
+      interrogation:
+        period: 0  # never send interrogation of this type
+        list: [io5000, io16000000]
+
+      # C_IC_NA_1(100) | Interrogation command
+      # specific interrogation groups: 1..16
+      # using group3 in this example
+      interrogation3:
+        list: [io5000, io16000000]
+
+      # Pulse durations for Qualifier Of Command (QOC)
+      # default pulse configuration, commandN can override
+      # TODO later
+      #pulse: {short: 5s, long: 10s}
+
+      # event queue mode, chosen internally in lib60870 with
+      # CONFIG_CS104_SUPPORT_SERVER_MODE_*
+      queue:
+        size: 1000  # default: 100
+        mode: single  # messages distrubuted between clients
+        #mode: per_connection  # messages copied to every client
+        #mode:  # messages copied to redgroups and distributed within
+        #  redgroup: [192.168.1.60, 192.168.1.61]
+        #  redgroup2: [192.168.1.62, 192.168.1.63]
+
+    client:
+      server: 192.168.1.205:2404
+      originator_address: 3
+
+      # connection level parameters (APCIP)
+      conn_parms:
+        k: 12  # max number APDUs to send until waiting for ack
+        w: 8   # receiver will ack after receiving `w' APDUs (w <= 2k/3).
+        t0: 3s # connection establishment timeout
+        t1: 15s # timeout waiting for ack from receiver
+        t2: 10s # receiver will ack after t2
+        t3: 20s # transmit keepalive message if idle for t3
+
+      # configurations with more than one "common address" (exotic)
+      # can be supported if nec by introducing subblocks
+      common_address: 1
+
+      clock_sync:
+        period: 10m  # sendClockSyncCommand every 10 minutes
+
+      # C_RD_NA_1: Read command
+      # common address=1, information object address = 81
+      # The server will respond with Measurement or Control
+      read81: { var: xyz1, period: 30s }
+      read1281: { var: abcd, period: 60s}
+
+      # C_IC_NA_1(100) | Interrogation command
+      # send "general interrogation" (qoi=20) every 10 minutes
+      # Could add a list: to respond to interrogation requests,
+      # but normally clients do not get any interrogation requests.
+      interrogation: {period: 10m}
+
+      # C_IC_NA_1(100) | Interrogation command
+      # send interrogation qoi=3) once a minute.
+      # Can use any qoi in {1..16}
+      interrogation3: {period: 1m}
+
+      # C_TS_TA_1 | Test command
+      # send test command every 30s
+      test: {period: 30s, tsc: 0x4938}
+
+      # default interval, if you want all variables forwarded
+      # and to avoid repeating interval: in every variable.
+      #interval: 1s
+
+      #
+      # Sending data to the server, spontaneously or periodically
+      #
+
+      # C_SE_TC_1(63) | Setpoint command, short value (FLOAT32) with CP56Time2a
+      # Sent every 5 seconds
+      command5000:
+        var_out: myvar55
+        type: float
+        period: 5s
+
+      # C_BO_TA_1(64) | Bitstring command (32 bit bitstring) with CP56Time2a
+      # Sent every 50 seconds
+      command5001:
+        var_out: myvar56
+        type: bitstring
+        period: 50s
+
+      # C_RC_TA_1 | Regulating step command
+      # Sent spontaneously, max 2HZ
+      command5010:
+        var_out: myvar60
+        type: stepposition
+        interval: 0.5s
+
+      # C_SC_TA_1(58) | Single command (BOOLEAN) with CP56Time2a
+      # Sent spontaneously, max 10HZ
+      command5011:
+        var_out: myvar61
+        type: singlepoint
+        interval: 0.1s
+
+      #
+      # Receiving data from the server
+      #
+
+      # forwarding to PLC bus is governed by period, interval and
+      # range, as everywhere.
+      io81:
+        var: myvar50
+        type: float
+        range: 0.1
+        interval: 10ms
+
+      # forwarding not allowed, data retrievable with read/interrogate
+      #ioa0x1234..0x1236:
+      #  var: myvar51..53
+      #  type: doublepoint
+      #  interval: 0  # overrides default interval, disables forwarding
+
+    #client2:
+    # ...
+
+
+  # PLC logic programs
+  var:
+    START: 0
+    OUT1: 1
+    OUT2: 1
+  task0:
+    period: 1ms
+    maxrun: 5ms
+    prog1: {enable: y, file: "examples/01-oscillator.st", maxrun: 1.5ms}
+    prog2: {enable: y, file: "examples/02-valve.st"}
+  on_stop:
+    maxrun: 100ms
+    prog991: {enable: y, file: "examples/01-onstop.st"}
+
+
+  # RS-485 interface parameters, for Modbus RTU server or client
+  rs485:
+    speed: 9600
+    parity: N
+    bits: 8
+    stop_bits: 1
+    termination: 120  # optional; 100 or 120 or 680 Ohm
+    pullup: enable    # optional: enable/disable
+
+  # Modbus parameters common for TCP and RTU modes --
+  # mapping variables to Modbus address space
+  modbus_server:
+    tcp_port: 502  # optional; if present, enables Modbus TCP
+    #rtu_addr: 0x15  # optional; if present, enables Modbus RTU
+    #coil0: {var: prog0_start}
+    #inbit101: {var_out: prog0_out1}
+    #inbit102: {var_out: prog0_out2}
+    #coil2: {}
+    inreg0xA: {var_out: "test0.1hz"}
+    #holding0x200: {}
+
+  # data input with Modbus client from a Modbus server
+  modbus_client:
+    server: 192.168.1.60:1502
+    # optional, default is 0.5s
+    #response_timeout: 800ms
+    # data from remote input register 10 are published
+    # as myvar1 within plc1
+    inreg10: {var: myvar1, period: 5s}
+    # remote input register 15 from slave with address 210 on RTU
+    # bus behind this Modbus TCP server are published as myvar2
+    # within plc1.  Polled faster than inreg10 above.
+    #inreg125: {addr: 210, var: myvar2, period: 0.5s}
+    # this will copy myvar2 obtained from inreg125
+    # to holding register 15 on the same Modbus server
+    holding5: {var_out: "test0.1hz", period: 5s}
+    # Read Input Registers Fn can read up to 125 consecutive regs in
+    # one operation.  Here we read 8 consecutive registers from
+    # input register with hexadecimal address 1234 into
+    # myvar3 ... myvar10.
+    #inreg0x1234: {var: myvar3..10, period: 1s}
+
+#  modbus_client2:
+#    addr: 1
+#    holding4200: {var_out: testRTUclient_int, period: 0.45s}
+#    holding4101: {var_out: testRTUclient_color,   period: 0.45s}
+#    holding4107: {var_out: testRTUclient_mode,    period: 0.45s}
+#    holding4108: {var_out: testRTUclient_point,   period: 0.45s}
+#    holding4250: {var_out: testRTUclient_seg1, period: 0.45s}
+#    holding4250: {var_out: testRTUclient_seg1..2, period: 0.45s}
+
+  # can poll multiple servers
+  #modbus_client2:
+  #  server: 192.168.1.201:502
+  #  inreg111: {var: myvar2, period: 0.5s}
+  #  inbit222: {var: myvar3, period: 0.1s}
+  #modbus_client3:
+  #  addr: 0x15  # RTU
+  #  speed: 115200
+  #  parity: N
+  #  bits: 8
+  #  stop_bits: 1
+
+
+# Config for other PLCs, if any
+#plc_foo:
+#  slot1:
+#    ...
+#bar:
+#  slot1:
+#    ...
+
+
+# LB241CPU (LB241BC with additional PLC feature)
+plc_lb241:
+  clock:
+    TZ: MSK
+    sntp_server: ntp.ix.ru
+    sntp_server2: pool.ntp.org
+    sntp_smooth: y  # y=use adjtime, n=use settimeofday
+
+  # static IP address. Disables DHCP client which is ON by default
+  #ipaddr: 10.1.1.5/23
+
+  # global variable initialization.  All variables declared
+  # VAR_EXTERNAL in programs must be listed here.  The type is
+  # "double" (aka LREAL) by default, automatically converted to the
+  # type used by program
+  var:
+    START: 1
+    OUT1: 1
+    OUT2: 1
+
+  # a task for high-priority, quick programs that run on events (aka SINGLE)
+  # Runs at priority 0 (highest)
+  task0:
+    single: trigger_var1  # will run prog1 and prog2 on every
+                          # trigger_var1 0->1 transition
+    maxrun: 80ms # stops sys.run (all plc tasks!) if the sum of actual
+                 # program run times turns out larger than 80ms
+    prog1:
+      enable: y
+      file: st/test1.st
+      maxrun: 50ms # stops sys.run if this program runs for so long
+    prog2:
+      enable: y
+      file: st/test2.st
+      maxrun: 50ms
+
+  # a task for high-priority, quick periodic programs
+  # Runs at priority 1 (high)
+  task1:
+    period: 200 ms
+    maxrun: 10ms
+    prog11:
+      enable: y
+      file: st/test11.st
+      maxrun: 7ms
+    prog12:
+      enable: y
+      file: st/test12.st
+      maxrun: 5ms
+
+  # a task for normal periodic programs
+  # Runs at priority 2 (middle)
+  task2:
+    period: 20ms    # 10ms ... +infinity/
+    maxrun: 40ms    # can exceed interval to tolerate run time fluctuations
+    prog21:
+      enable: y
+      file: st/test21.st
+    prog22:
+      enable: n
+      file: st/test22.st
+
+  # single-shot task that runs once on "Error, automation stop" event,
+  # and also on manual sys.run=0
+  # (but not on sys.run=-1 which also stops PLC)
+  on_stop:
+    maxrun: 100ms   # optional, defaults to 200ms
+    prog991:
+      enable: y
+      file: st/on_stop.st
+
+  slot-1:
+    module: bcbase
+    macaddr: f4:12:fa:d5:51:b7
+    modbus_server:
+      tcp_port: 502  # optional; if present, enables Modbus TCP
+      holding10..13: {var: ao0..3}
+      holding0..3: {var_out: ai0..3}
+      holding4: {var_out: t0}
+
+  slot-2:
+    module: bcbase
+    macaddr: f4:12:fa:d5:52:23
+
+  slot1:
+    module: bcai
+    chan0:
+      mode: Pt1000
+      wires: 2
+      resolution: 0.1           # change less 0.1°C is ignored
+      interval: 1s              # send not more often than this
+      period: 10s               # force send even if no change
+      var: t0
+    chan1:
+      mode: Pt1000
+      wires: 3
+      interval: 0.5s
+      period: 2s
+      scale: 100        # -327...+327°C with 0.01°C resolution in int16
+      resolution: 1     # applied to scaled value
+      var: ai1_grad_scaled100
+    chan2:
+      mode: 0-10V
+      interval: 0.5s
+      period: 1s
+      natural: [0, 10000]
+      resolution: 1     # applied to naturalized value
+      var: ai2
+    chan3:
+      mode: 4-20mA
+      interval: 0.5s
+      period: 1
+      natural: [4000, 20000]
+      resolution: 5
+      var: ai1_3
+
