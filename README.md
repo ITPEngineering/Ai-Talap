@@ -25,7 +25,7 @@ __AT340CPU__) in the same Ethernet LAN as your computer.
 1. Clone this repository along with dependencies:
 
    ```
-   git clone https://github.com/ITPEngineering/AT241
+   git clone https://github.com/ITPEngineering/Ai-Talap
    cd Ai-Talap
    git submodule update --init --recursive
    ```

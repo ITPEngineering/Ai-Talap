@@ -26,7 +26,7 @@ GNU/Linux](http://debian.org), конкретно Debian 11 (bullseye), и
 1. Клонируйте данный репозиторий вместе с зависимостями:
 
    ```
-   git clone https://github.com/ITPEngineering/AT241
+   git clone https://github.com/ITPEngineering/Ai-Talap
    cd Ai-Talap
    git submodule update --init --recursive
    ```
