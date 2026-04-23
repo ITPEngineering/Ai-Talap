@@ -16,7 +16,6 @@ sudo apt update && sudo apt install -y python3 python3-pip
 
 git clone https://github.com/ITPEngineering/Ai-Talap
 cd Ai-Talap
-git submodule update --init --recursive
 
 #Шаг третий. Установка средства для сборки транслятора matiec
 
