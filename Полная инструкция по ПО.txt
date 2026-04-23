@@ -1,0 +1,65 @@
+####Полная инструкция по установке программного обеспечения Ai-Talap
+####***ВНИМАНИЕ!!! Для установки необходимо просто вставить код, который представлен ниже, в командную строку Linux***
+
+###Начало кода установки
+
+#Шаг первый. Установка библиотек компилятора
+
+sudo apt-get update
+sudo apt-get install git git-gui
+sudo apt-get install libsocket6-perl libjson-perl libyaml-perl
+sudo apt-get install libdata-hexdump-perl
+sudo apt-get install build-essential autoconf
+sudo apt update && sudo apt install -y python3 python3-pip
+
+#Шаг второй. Клонирование репозитория
+
+git clone https://github.com/ITPEngineering/Ai-Talap
+cd Ai-Talap
+git submodule update --init --recursive
+
+#Шаг третий. Установка средства для сборки транслятора matiec
+
+sudo apt-get update
+sudo apt-get install build-essential autoconf
+make -C matiec
+
+#Шаг четвертый. Установка среды разработки ESP­IDF
+
+echo "deb [trusted=yes] https://dl.espressif.com/dl/eim/apt/ stable main" | sudo tee /etc/apt/sources.list.d/espressif.list
+sudo apt update
+sudo apt install eim
+sudo tee /etc/yum.repos.d/espressif-eim.repo << 'EOF'
+[eim]
+name=ESP-IDF Installation Manager
+baseurl=https://dl.espressif.com/dl/eim/rpm/$basearch
+enabled=1
+gpgcheck=0
+EOF
+sudo dnf install eim
+
+eim install
+
+#Автоматизация сборки ПО
+
+cat << 'EOF' >> ~/.bashrc
+
+# ==== Ai-Talap setup ====
+cd ~/Ai-Talap
+export PATH="$PATH:$(pwd)/bin"
+
+make -C matiec
+
+cd ~/esp/esp-idf
+. $HOME/esp/esp-idf/export.sh
+cd
+
+cd ~/Ai-Talap
+# ==== end Ai-Talap ====
+
+EOF
+
+###Конец кода установки
+
+
+

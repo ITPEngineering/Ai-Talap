@@ -32,5 +32,12 @@ __AT340CPU__) in the same Ethernet LAN as your computer.
 2. Say `make -C matiec` to build `matiec` translators (only necessary
    to control PLC, not needed for __AT241BC__ RTU module)
 
+## Automatic Installation
+
+1. Open the file "Полная инструкция по ПО.txt"
+2. Copy the text
+3. Paste to your Linux Terminal
+4. Wait for installation to finish
+
 
 
