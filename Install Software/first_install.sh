@@ -8,7 +8,7 @@ sudo apt-get install libdata-hexdump-perl
 sudo apt-get install build-essential autoconf
 sudo apt update && sudo apt install -y python3 python3-pip
 
-echo "Установка библиотек компилятора выполнена успешна!"
+echo "Установка библиотек компилятора выполнена успешно!"
 
 #Шаг второй. Установка средства для сборки транслятора matiec
 
@@ -16,7 +16,7 @@ sudo apt-get update
 sudo apt-get install build-essential autoconf
 make -C matiec
 
-echo "Установка средства для сборки транслятора matiec успешна!"
+echo "Установка средства для сборки транслятора matiec выполнена успешно!"
 
 #Шаг третий. Установка среды разработки ESP­IDF
 #All original source code in this repository is Copyright (C) 2015-2023 Espressif Systems. This source code is licensed under the Apache License 2.0 as described in the file LICENSE.
@@ -34,6 +34,8 @@ EOF
 sudo dnf install eim
 
 eim install
+
+echo "Установка среды разработки ESP­IDF выполнена успешно!"
 
 #Шаг четвертый. Автоматизация сборки ПО
 
@@ -53,5 +55,7 @@ cd ~/Ai-Talap
 # ==== end Ai-Talap ====
 
 EOF
+
+echo "Автоматизация сборки ПО выполнена успешно!"
 
 ###Конец кода установки
