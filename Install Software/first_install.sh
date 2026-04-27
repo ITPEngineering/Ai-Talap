@@ -49,8 +49,6 @@ find bin -type f -exec chmod +x {} \;
 
 cat << 'EOF' >> ~/.bashrc
 
-cat << EOF >> ~/.bashrc
-
 # ==== Ai-Talap setup ====
 cd "$AI_TALAP_DIR"
 export PATH="\$PATH:$AI_TALAP_DIR/bin"
