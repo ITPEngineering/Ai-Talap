@@ -47,7 +47,7 @@ find bin -type f -exec chmod +x {} \;
 
 #Шаг пятый. Автоматизация сборки ПО
 
-cat << 'EOF' >> ~/.bashrc
+cat << EOF >> ~/.bashrc
 
 # ==== Ai-Talap setup ====
 cd "$AI_TALAP_DIR"
