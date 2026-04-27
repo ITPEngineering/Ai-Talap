@@ -22,22 +22,29 @@ __AT340CPU__) in the same Ethernet LAN as your computer.
 
 ## Installation
 
-1. Clone this repository along with dependencies:
+1. Install the Git-Library:
+
+   ```
+   sudo apt-get update
+   sudo apt-get install git git-gui
+
+   ```
+2. Clone the repository
 
    ```
    git clone https://github.com/ITPEngineering/Ai-Talap
    cd Ai-Talap
    git submodule update --init --recursive
+
    ```
-2. Say `make -C matiec` to build `matiec` translators (only necessary
-   to control PLC, not needed for __AT241BC__ RTU module)
+3. Run the script for automatic installation
 
-## Automatic Installation
-
-1. Open the file "Полная инструкция по ПО.txt"
-2. Copy the text
-3. Paste to your Linux Terminal
-4. Wait for installation to finish
+   ```
+   export PATH="$PATH:$(pwd)/Install Software"
+   chmod +x "Install Software/first_install.sh"
+   first_install.sh
+   
+   ```
 
 
 

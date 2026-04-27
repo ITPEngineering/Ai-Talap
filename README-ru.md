@@ -23,20 +23,27 @@ GNU/Linux](http://debian.org), конкретно Debian 11 (bullseye), и
 
 ## Установка
 
-1. Клонируйте данный репозиторий вместе с зависимостями:
+1. Установите Git:
+
+   ```
+   sudo apt-get update
+   sudo apt-get install git git-gui
+
+   ```
+2. Клонируйте репозиторий
 
    ```
    git clone https://github.com/ITPEngineering/Ai-Talap
    cd Ai-Talap
    git submodule update --init --recursive
+
    ```
-2. Выполните команду `make -C matiec` для сбoрки транслятора `matiec`
-   (только для ПЛК; не требуется для управления УСО __AT241BC__)
+3. Запустите скрипт для автоматической установки
 
-## Автоматическая установка
-
-1. Откройте файл "Полная инструкция по ПО.txt"
-2. Скопируйте его
-3. Вставьте в Ваш Linux-терминал
-4. Дождитесь окончания установки
+   ```
+   export PATH="$PATH:$(pwd)/Install Software"
+   chmod +x "Install Software/first_install.sh"
+   first_install.sh
+   
+   ```
 
