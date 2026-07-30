@@ -53,13 +53,13 @@ cat << EOF >> ~/.bashrc
 cd "$AI_TALAP_DIR"
 export PATH="\$PATH:$AI_TALAP_DIR/bin"
 
-#make -C matiec
+make -C matiec
 
-#cd ~/esp/esp-idf
-#. \$HOME/esp/esp-idf/export.sh
-#cd
+cd ~/esp/esp-idf
+. \$HOME/esp/esp-idf/export.sh
+cd
 
-#cd "$AI_TALAP_DIR"
+cd "$AI_TALAP_DIR"
 # ==== end Ai-Talap ====
 
 EOF
