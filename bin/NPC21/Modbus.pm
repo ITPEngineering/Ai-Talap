@@ -178,12 +178,13 @@ sub error {
 }
 
 
-# preform a single npc21_modbus protocol operation on the base module,
-# a module in a slot or a slave device on a bus behind BCMG module.
+# preform a primitive npc21_modbus protocol operation on the base
+# module, a module in a slot, or a slave device on a bus behind BCMG
+# module.
 #
 # $tag e.g. NPC21_MODBUS_TAG_OTA_BEGIN
 # $req e.g. pack ("N", $image_length)
-sub npc21 {
+sub npc21op {
     my $self = shift;
     my ($tag, $req) = @_;
     my $slot = $self->{SLOT};
@@ -211,6 +212,49 @@ sub npc21 {
     }
 
     return $reply;
+}
+
+
+# preform a (maybe long, fragmented) npc21_modbus protocol operation
+#
+# $tag e.g. NPC21_MODBUS_TAG_OTA_BEGIN
+# $req e.g. pack ("N", $image_length)
+sub npc21 {
+    my $self = shift;
+    my ($tag, $req) = @_;
+
+    my $since = time;
+    my $len0 = length ($req);
+
+    my $maxsz = MAXLEN; # full in npc21_modbus_update
+    $maxsz -=3 if defined $self->{SLOT}; # NPC21_MODBUS_TAG_SLOT overhead
+    $maxsz -=3 if defined $self->{SLOT2};
+    if (length($req) > $maxsz) {
+        my $piece = substr ($req, $maxsz, $maxsz-4);
+        substr ($req, $maxsz, $maxsz-4) = "";
+        my $req1 = pack("Na*", length($req), $piece);
+        my $reply = $self->npc21op(TAG_START, $req1);
+        if (my $err = error($reply)) {
+            carp "error: $err\n";
+        }
+
+        while (length($req) > $maxsz) {
+            my $piece = substr ($req, $maxsz, $maxsz);
+            substr ($req, $maxsz, $maxsz) = "";
+            my $reply = $self->npc21op(TAG_UPDATE, $piece);
+            if (my $err = error($reply)) {
+                carp "error: $err\n";
+            }
+            if ((time - $since) >= 3) {
+                $since = time;
+                warn sprintf "%u%%\n", ($len0 - length($req)) / $len0*100;
+            }
+        }
+    }
+
+    # Now that excess length has been sent in fragments,
+    # issue the command proper
+    return $self->npc21op($tag, $req);
 }
 
 

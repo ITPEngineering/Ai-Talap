@@ -19,7 +19,7 @@ my $conffile;
 sub load {
     my ($name) = @_;
 #warn "$name";
-    $conffile //= $file;  # hack for error reporting in sub macaddr
+    $conffile //= $name;  # hack for error reporting in sub macaddr
 
     if (-f $name) {
 #warn CHECKPOINT, $name;
@@ -118,7 +118,8 @@ sub macaddr {
             return $_->[1];
         }
     }
-    die "$conffile: $plc_name: no base module with macaddr\n";
+    die ("$conffile: $plc_name: no base module with macaddr attribute\n",
+         "Check macaddr: and module: attributes\n");
 }
 
 

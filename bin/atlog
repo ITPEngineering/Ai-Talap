@@ -1,6 +1,6 @@
 #!/usr/bin/perl
 
-# upload YAML config to Logic Box family PLC
+# upload YAML config to Ai-Talap family PLC
 
 use strict; no strict 'subs';
 use Carp;
@@ -73,7 +73,7 @@ $SIG{PIPE} = sub {
 
 sub parse_args {
     while (defined ($_ = shift @ARGV)) {
-        if (!$plc_name && s/^([a-z][.\w]+)(:(\d+))?(\/(-?\d+))?(\/(-?\d+))?$//i) { # order!
+        if (!$plc_name && s/^([a-z][-.\w]+)(:(\d+))?(\/(-?\d+))?(\/(-?\d+))?$//i) { # order!
             $plc_name = $1;
             $plc_slot = $5;
             $plc_slot2 = $7;
@@ -136,8 +136,18 @@ if (! $tree->{$plc_name}) {
 }
 $tree->{$plc_name}{hostname} //= $plc_name;
 
-my $ipaddr = ($tree->{$plc_name}{ipaddr} =~ s/\/\d+//r);  # static IP, optional
-my $macaddr = NPC21::Conf::macaddr ($tree, $plc_name, $lan_slot);
+my $talkto = $plc_name;
+if ($tree->{$plc_name}{"path"}) {
+    if (defined $plc_slot || defined $plc_slot2) {
+        die ("$conffile: $plc_name has 'path' attribute, ",
+             "don't give the path on the command line\n");
+    }
+    ($talkto, $plc_slot, $plc_slot2) =
+        split '/', $tree->{$plc_name}{"path"};
+}
+
+my $ipaddr = ($tree->{$talkto}{ipaddr} =~ s/\/\d+//r);  # static IP, optional
+my $macaddr = NPC21::Conf::macaddr ($tree, $talkto, $lan_slot);
 
 $m = NPC21::Modbus->new(
     HOST => ($ipaddr || $macaddr),
@@ -179,12 +189,11 @@ for (;;) {
     my $req = pack("C", $fd);
     my $reply = $m->npc21(NPC21::Modbus::TAG_LOGMORE, $req);;
     if (my $err = NPC21::Modbus::error ($reply)) {
-        if ($err =~ /temporarily unavailable/) { # EAGAIN is normal
-            $logdata = "";
-            sleep 1;
-            next;
-        }
-        die "LOGMORE command: $err\n";
+        warn "LOGMORE command: $err, retrying...\n"
+            unless $err =~ /temporarily unavailable/; # EAGAIN is normal
+        $logdata = "";
+        sleep 1;
+        next;
     }
     my $fd2;
     (undef, $fd2, $logdata) = unpack ("CCa*", $reply);

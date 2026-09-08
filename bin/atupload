@@ -1,6 +1,6 @@
 #!/usr/bin/perl
 
-# compile & upload PLC program in ST language to LogicBox PLC
+# compile & upload PLC program in C language to Ai-Talap PLC
 
 use strict; no strict 'subs';
 use Carp;
@@ -32,22 +32,26 @@ sub usage {
          "       atupload PLCNAME progN -c\n",
 #        "       atupload PLCNAME progN -cc\n",  /*undocumented*/
          "       atupload -c [path_to/]FILENAME.st\n",
+         "       atupload [-k|--keep-builddir] ...\n",
          "       atupload [-f conffile.yml] ...\n");
 }
 
 
 my $plc_name;
+my $plc_slot;  # addressing non-master slot
+my $plc_slot2; # e.g. AT241CS beyond AT241MG
 my $lan_slot;  # access PLC via LAN port in this slot
 my $progn;
 my $compile_only; # disable upload
 my $srcfile;
 my $conffile = "$basedir/conf/conf.yml";
 my $same_size_workaround;
-
+my $builddir = "";
+my $keep_builddir;
 
 sub parse_args {
     while (defined (local $_ = shift @ARGV)) {
-        if (/^([a-z][.\w]+)(:(\d+))?$/i && !$plc_name) {
+        if (/^([a-z][-.\w]+)(:(\d+))?$/i && !$plc_name) {
             $plc_name = $1;
             $lan_slot = $3;
         }
@@ -66,6 +70,9 @@ sub parse_args {
                 $srcfile = shift @ARGV;
                 $srcfile =~ s/^/getcwd . "\/"/e unless $srcfile =~ /^\//;
             }
+        }
+        elsif (/^-k|--keep-builddir$/) {
+            $keep_builddir = 1;
         }
         elsif (/^-f(.*)$/) {
             $conffile = $1 || shift @ARGV;
@@ -96,8 +103,19 @@ if (! $tree->{$plc_name}) {
 
 $tree->{$plc_name}{hostname} //= $plc_name;
 
-my $ipaddr = ($tree->{$plc_name}{ipaddr} =~ s/\/\d+//r);  # static IP, optional
-my $macaddr = NPC21::Conf::macaddr ($tree, $plc_name, $lan_slot);
+my $talkto = $plc_name;
+if ($tree->{$plc_name}{"path"}) {
+    if (defined $plc_slot || defined $plc_slot2) {
+        die ("$conffile: $plc_name has 'path' attribute, ",
+             "don't give the path on the command line\n");
+    }
+    ($talkto, $plc_slot, $plc_slot2) =
+        split '/', $tree->{$plc_name}{"path"};
+}
+
+my $ipaddr = ($tree->{$talkto}{ipaddr} =~ s/\/\d+//r);  # static IP, optional
+my $macaddr = NPC21::Conf::macaddr ($tree, $talkto, $lan_slot);
+
 my $m = NPC21::Modbus->new(HOST => ($ipaddr || $macaddr));
 
 # determine the target architecture (AT241 -> ESP32s3, AT340 -> ESP32)
@@ -108,7 +126,7 @@ for (keys %{$tree->{$plc_name}}) {
             my $prev = $arch;
             $arch = "xtensa-esp32s3-elf" if $module =~ /^bcbase/;
             $arch = "xtensa-esp32s3-elf" if $module =~ /^AT241/;
-            $arch = "xtensa-esp32-elf" if $module =~ /^LB340/;
+            $arch = "xtensa-esp32-elf" if $module =~ /^AT340/;
             if ($prev && $arch ne $prev) {
                 die "$_: $module: inconsistent with another slot\n";
             }
@@ -123,24 +141,32 @@ for (keys %{$tree->{$plc_name}}) {
     next unless /^task\d+$/ || /^on_stop$/;
     if ($tree->{$plc_name}{$_}{"prog$progn"}) {
         $srcfile = $tree->{$plc_name}{$_}{"prog$progn"}{file}
-        or die "$conffile: prog$progn: missing `file' attribute\n";
+          or die "$conffile: prog$progn: missing `file' attribute\n";
         last;
     }
 }
 
 defined $srcfile or die "$conffile: $plc_name: missing `prog$progn'\n";
 if ($srcfile !~ /^\//) {
-    $srcfile = "$basedir/st/$srcfile";
+    $srcfile = "$basedir/plcprog/$srcfile";
 }
 -f $srcfile or die "$srcfile: $!\n";
 
 
 compile:
-my $dir = "$basedir/st";
+my $dir = ($srcfile =~ /\.st$/? "$basedir/plcprog/st":
+           $srcfile =~ /\.c$/? "$basedir/plcprog/c":
+           die "$srcfile: either .st or .c expected\n");
 $arch //= "xtensa-esp32s3-elf";  # for -c srcfile
+
+$builddir = `mktemp --directory --tmpdir atupload.XXXXXXX`;
+$? == 0 || die;
+chomp $builddir;
+
+my $make = "make -C$dir ARCH=$arch SRCFILE=$srcfile BUILD=$builddir";
 my ($textsz, $datasz, $bsssz) = do {
-    my $cmd = "make -C$dir ARCH=$arch SRC=$srcfile size";
-    warn "$cmd\n";
+    my $cmd = "$make size\n";
+    warn $cmd;
     local $_ = `$cmd`;
     $? == 0 or exit ($?>>8);    # make already reported the error
     /(\d+)\s+(\d+)\s+(\d+)/;
@@ -182,19 +208,15 @@ for ($text, $data, $bss) {
     $_ = sprintf("0x%08x", $_);
 }
 
-my @cmd = ();
-push @cmd, "make -C$dir ARCH=$arch SRC=$srcfile";
-push @cmd, "TEXT_START=$text DATA_START=$data BSS_START=$bss binary";
-#push @cmd, "> $dir/build/make.out 2>&1";
-warn "@cmd\n";
-system("@cmd");
-#$? == 0 or die "Compilation command: @cmd\nFailed, see $dir/build/make.out\n";
+my $cmd = "$make TEXT_START=$text DATA_START=$data BSS_START=$bss binary";
+warn "$cmd\n";
+system($cmd);
 $? == 0 or die "\n";
 
 # concatenate text.bin and data.bin, make sure data.bin is at
 # offset=textsz (whereas text.bin may turn out shorter than textsz
 # because of linker optimizations)
-my $file = "$dir/build/text.bin";
+my $file = "$builddir/text.bin";
 open(my $fh, $file) or die "$file: $!\n";
 sysread($fh, my $text_img, 1e6) == -s $file
     or die "$file: too big or I/O error\n";
@@ -203,7 +225,7 @@ if (length($text_img) < $textsz) {
 }
 die unless length($text_img) == $textsz;
 
-$file = "$dir/build/data.bin";
+$file = "$builddir/data.bin";
 open($fh, $file) or die "$file: $!\n";
 sysread($fh, my $data_img, 1e6) == -s $file
     or die "$file: too big or I/O error\n";
@@ -211,7 +233,7 @@ if (length($data_img) < $datasz) {
     $data_img .= "\0" x ($datasz - length($data_img));
 }
 
-#$file = "$dir/build/debug.bin";
+#$file = "$builddir/debug.bin";
 #open($fh, ">$file") or die "$file: $!\n";
 #syswrite($fh, $img);
 
@@ -275,3 +297,15 @@ warn "OK uploaded prog$progn from $srcfile\n";
 
 $m->close();
 exit 0;
+
+
+END {
+    if (-d $builddir) {
+        if ($keep_builddir) {
+            warn "build files preserved in $builddir/\n";
+        }
+        else {
+            system "rm -rf $builddir";
+        }
+    }
+}

@@ -1,9 +1,9 @@
 #!/usr/bin/perl
 
-# discover Logix Box PLCs on the local network.
+# discover Ai-Talap PLCs on the local network.
 # version 1 used MDNS which proved overly complex and freaky.
 # version 2 uses a multicast group ff02::4c6f:6769:6342:6f78
-# dedicated to LogicBox discovery
+# dedicated to Ai-Talap discovery
 
 use strict; no strict 'subs';
 use Carp;
@@ -11,6 +11,7 @@ use JSON;
 use POSIX;
 use Digest::SHA qw(sha256);
 use Data::Dumper;
+use Data::HexDump;
 my $basedir;
 BEGIN {
     # find the base directory path, assuming this script is
@@ -74,18 +75,25 @@ sub list_ifaces {
 
 
 sub get_getails {
-    my ($mac, $iface) = @_;
-    my $m = NPC21::Modbus->new(HOST => $mac, IFACE => $iface);
+    my ($addr, $iface) = @_;
+    my $m = NPC21::Modbus->new(HOST => $addr, IFACE => $iface);
     my %req;
     $req{"getconf"} = "1";
+    $req{"get"}{"sys.macaddr"} = "";
     $req{"get"}{"sys.ipaddr"} = "";
     $req{"get"}{"sys.devtype"} = "";
+    $req{"get"}{"sys.btnage"} = "";
+  retry:
     my $json = JSON->new;
     my $img = $json->encode(\%req);
     my $req = pack("a32a*", sha256($img), $img);
     my $reply = $m->npc21(NPC21::Modbus::TAG_CMDS, $req);
     my $err = NPC21::Modbus::error ($reply);
     if ($err) {
+        if ($err =~ /btnage.*not found/) {  # old firmware
+            delete $req{"get"}{"sys.btnage"};
+            goto retry;
+        }
         die "CMDS command: $err\n";
     }
     if (length ($reply) < 1+256/8) {
@@ -123,8 +131,22 @@ sub get_getails {
     }
     push @res, $hh->{get}{"sys.devtype"} || "<notype>";
     push @res, sprintf "[%s]", $hh->{get}{"sys.ipaddr"} || "";
+    for ($hh->{get}{"sys.btnage"}) {
+        if (defined $_ && /^\d+/) {
+            push @res, sprintf("(%u)", $_);
+        }
+        else { # no button or never pressed
+            push @res, "()";
+        }
+    }
+    if ($hh->{get}{"sys.macaddr"}) {
+        push @res, $hh->{get}{"sys.macaddr"} =~ s/(\w\w)(?!$)/$1:/gr;
+    }
+    else {
+        push @res, $addr;
+    }
 
-    return "@res";
+    return @res;
 }
 
 
@@ -135,57 +157,72 @@ my @ifaces = list_ifaces();
 @ifaces || die "ip link ls found no suitable interfaces";
 
 # ping on all suitable interfaces in parallel to speed up
-my $logicbox_mcast_addr =  "ff02::4c6f:6769:6342:6f78";
+my $Ai_Talap_mcast_addr =  "ff02::4c6f:6769:6342:6f78";
 my @cmd;
 for my $iface (@ifaces) {
-    push @cmd, "ping6 -w2 $logicbox_mcast_addr\%$iface"
+    push @cmd, "ping6 -w2 $Ai_Talap_mcast_addr\%$iface"
 }
 my $cmd = join '&', @cmd;
 #warn $cmd;
 my %seen;
 for (`$cmd`) {
     # 64 bytes from fe80::f612:faff:fed5:5197%eth1: icmp_seq=0 ttl=255 time=1.362 ms
-    /^64 bytes from fe80::(\w+):(\w+):(\w+):(\w+)\%(\w+)/
+    /^64 bytes from (fe80::(\w+):(\w+):(\w+):(\w+)\%(\w+))/
         && do {
-            my $iface = $5;
-            my @a = map {hex} $1, $2, $3, $4;
+            my $ip6addr = $1;
+            my $iface = $6;
+            my @a = map {hex} $2, $3, $4, $5;
             $a[0] ^= 0x0200;
             my @b = map {($_ >> 8, $_ & 0xff)} @a;
-            splice @b, 3, 2;  # take out ff:fe
-            my $macaddr = sprintf "%02x:%02x:%02x:%02x:%02x:%02x", @b;
-            $seen{$macaddr}{$iface} = 1;  # same MAC can be seen on multiple ifaces
-            warn "seen $macaddr at $iface\n" if $verbose;
+            if ($b[3] == 0xff && $b[4] == 0xfe) { # EUI-48 based link-local ip6addr
+                splice @b, 3, 2;  # take out ff:fe
+                my $macaddr = sprintf "%02x:%02x:%02x:%02x:%02x:%02x", @b;
+                $seen{$macaddr}{$iface} = 1;  # same MAC can be seen on multiple ifaces
+                warn "seen $macaddr at $iface\n" if $verbose;
+            }
+            else { # e.g. fe80::aeed:2ebf:3032:2f26 from AT241CPU64
+                $seen{$ip6addr}{$iface} = 1;
+                warn "seen $ip6addr at $iface\n" if $verbose;
+            }
     };
 }
 
-if (!keys %seen) {
-    print "Доступные устройства не обнаружены\n";
-    exit 0;
-}
-
-MAC: for my $mac (sort keys %seen) {
-    $seen{$mac} = [keys %{$seen{$mac}}];  # convert seen{}{} to seen{}[]
-    if ($newonly) {
-        # need conffile for the first time
+my @out;
+ADDR: for my $addr (keys %seen) {
+    $seen{$addr} = [keys %{$seen{$addr}}];  # convert seen{}{} to seen{}[]
+    if ($newonly) {  # list only those missing in conf.yml
         my $tree = NPC21::Conf::load($conffile);
         #die Dumper $tree;
         for my $plc_name (keys %$tree) {
             if (my $macaddr = $tree->{$plc_name}{macaddr}) {
-                if ($macaddr eq $mac) {
-                    next MAC;
+                if ($macaddr eq $addr) {
+                    next ADDR;
                 }
             }
         }
     }
-    my $iface = $seen{$mac}[0];
-    my $ifaces = join ",", @{$seen{$mac}};
-    my $details = eval {get_getails ($mac, $iface)};
-    if ($details) {
-        print "$details $mac $ifaces\n";
+    my $iface = $seen{$addr}[0];
+    my $ifaces = join ",", @{$seen{$addr}};
+    my @details = eval {get_getails ($addr, $iface)};
+    if (@details) {
+        push @out, "@details $ifaces\n";
     }
     else {
-        print "$mac $ifaces: $@";
+        push @out, "$addr $ifaces: $@\n";
     }
 }
+
+# sort "recent button press last",
+# else by macaddr (name may be absent or duplicate)
+print sort {
+    "$a$b" =~ /\((\d*)\).*\((\d*)\)/s;
+    if ("$1$2") {
+        ($2 || 1e100) <=> ($1 || 1e100);
+    }
+    else {
+        "$a$b" =~ /\) (.*).*\) (.*)/s;
+        $1 cmp $2;
+    }
+} @out;
 
 exit 0;

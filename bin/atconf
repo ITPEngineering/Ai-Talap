@@ -1,11 +1,12 @@
 #!/usr/bin/perl
 
-# upload YAML config to LogicBox PLC
+# upload YAML config to Ai-Talap PLC
 
 use strict; no strict 'subs';
 use Carp;
 use JSON;
 use Data::Dumper;
+use Data::HexDump;
 use Time::HiRes qw(sleep gettimeofday tv_interval);
 use POSIX;
 use Socket;  # for inet_ntoa
@@ -34,17 +35,22 @@ sub usage {
 
 
 my $plc_name;  # as seen in conf.yml
+my $plc_slot;
+my $plc_slot2;
 my $lan_slot;  # access PLC via LAN port in this slot
 my $bymac; # use IPv6 even if static ipaddr is present in conf.yml
 my $iface; # if not specified, will try all ifaces in parallel
 my $conffile = "$basedir/conf/conf.yml";
 my $timeout = 10;  # for CONFSTAT, seconds
+my $verbose;
 
 
 sub parse_args {
     while (local $_ = shift @ARGV) {
-        if (/^([a-z][.\w]+)(:(\d+))?$/i && !$plc_name) {
+        if (/^([a-z][-.\w]+)(:(-?\d+))?(\/(-?\d+)(\/(\d+))?)?$/i && !$plc_name) {
             $plc_name = $1;
+            $plc_slot = $5;
+            $plc_slot2 = $7;
             $lan_slot = $3;
         }
         elsif (/^-f(.*)$/) {
@@ -89,8 +95,18 @@ if (! $tree->{$plc_name}) {
 # hostname equals to plc_name by default but can be set explicitly
 $tree->{$plc_name}{hostname} //= $plc_name;
 
-my $ipaddr = ($tree->{$plc_name}{ipaddr} =~ s/\/\d+//r);  # static IP, optional
-my $macaddr = NPC21::Conf::macaddr ($tree, $plc_name, $lan_slot);
+my $talkto = $plc_name;
+if ($tree->{$plc_name}{"path"}) {
+    if (defined $plc_slot || defined $plc_slot2) {
+        die ("$conffile: $plc_name has 'path' attribute, ",
+             "don't give the path on the command line\n");
+    }
+    ($talkto, $plc_slot, $plc_slot2) =
+        split '/', $tree->{$plc_name}{"path"};
+}
+
+my $ipaddr = ($tree->{$talkto}{ipaddr} =~ s/\/\d+//r);  # static IP, optional
+my $macaddr = NPC21::Conf::macaddr ($tree, $talkto, $lan_slot);
 
 if ($bymac) {
     $ipaddr = undef;
@@ -103,33 +119,19 @@ if ($bymac) {
 # convert configuration subtree of the PLC to JSON to be uploaded
 my $json = JSON->new->canonical([ENABLE]); # canonical == sorted keys
 my $img = $json->encode($tree->{$plc_name});
-my $m = NPC21::Modbus->new(HOST => ($ipaddr || $macaddr), IFACE => $iface);
+my $m = NPC21::Modbus->new(
+    HOST => ($ipaddr || $macaddr),
+    IFACE => $iface,
+    SLOT => $plc_slot,
+    SLOT2 => $plc_slot2,
+    VERBOSE => ($verbose >= 2),
+    );
 # TODO: PORT from conf.yml
 
-my $offset = 0;
-my $chunksz = NPC21::Modbus::MAXLEN - 4; # shorter in npc21_modbus_start
-while (my $piece = substr($img, $offset, $chunksz)) {
-    #warn "chunk upload: @{[length $piece]}\@$offset\n";
-    my $reply;
-    if ($offset == 0) {
-        my $pktlen = pack("N", length $img);
-        $reply = $m->npc21(NPC21::Modbus::TAG_START, $pktlen.$piece);
-    }
-    else {
-        $reply = $m->npc21(NPC21::Modbus::TAG_UPDATE, $piece);
-    }
-    if (my $err = NPC21::Modbus::error ($reply)) {
-        die "chunk upload error: $err\n";
-    }
-    $offset += $chunksz;
-    $chunksz = NPC21::Modbus::MAXLEN;  # full in npc21_modbus_update
-}
-
-# Issue CONF command to verify and activate the uploaded conf
-my $reply = $m->npc21(NPC21::Modbus::TAG_CONF, pack("a32", sha256($img)));
-if (my $err = NPC21::Modbus::error ($reply)) {
-    die "CONF command error: $err\n";
-}
+my $req = pack("a32a*", sha256($img), $img);
+warn HexDump($req) if $verbose == 1;
+my $reply = $m->npc21(NPC21::Modbus::TAG_CONF, $req);
+warn HexDump($reply) if $verbose;
 
 # Use CONFSTAT commands to wait for completion
 my $start = [gettimeofday];
