@@ -44,6 +44,8 @@ AI_TALAP_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 cd "$AI_TALAP_DIR"
 find bin -type f -exec chmod +x {} \;
+find "plcprog/c/scripts" -type f -exec chmod +x {} \;
+
 
 #Шаг пятый. Автоматизация сборки ПО
 
